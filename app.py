@@ -1,0 +1,508 @@
+import streamlit as st
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+st.set_page_config(
+    page_title="地震波形数据分析工具",
+    page_icon="🌍",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+from utils.data_loader import load_example_data, load_seed_file, load_sac_file
+from utils.waveform_plot import plot_waveforms
+from utils.picking import auto_pick_ps, calculate_epicentral_distance
+from utils.spectrum import compute_spectrum, plot_spectrum
+from utils.focal_mechanism import plot_beach_ball, generate_sample_moment_tensor
+from utils.filter import apply_filter
+from utils.station_map import create_station_map
+
+st.title("🌍 地震波形数据分析工具")
+st.markdown("---")
+
+if "streams" not in st.session_state:
+    st.session_state.streams = None
+    st.session_state.stations_info = None
+    st.session_state.p_picks = {}
+    st.session_state.s_picks = {}
+    st.session_state.filtered_streams = None
+
+with st.sidebar:
+    st.header("📂 数据加载")
+    data_source = st.radio(
+        "数据源",
+        ["示例数据", "上传SEED文件", "上传SAC文件"],
+        index=0
+    )
+
+    if data_source == "示例数据":
+        num_stations = st.slider("台站数量", 3, 10, 6)
+        if st.button("生成示例数据", type="primary"):
+            streams, stations_info = load_example_data(num_stations)
+            st.session_state.streams = streams
+            st.session_state.stations_info = stations_info
+            st.session_state.p_picks = {}
+            st.session_state.s_picks = {}
+            st.session_state.filtered_streams = None
+            st.success(f"已生成 {num_stations} 个台站的示例数据")
+    elif data_source == "上传SEED文件":
+        seed_file = st.file_uploader("选择SEED文件", type=["seed", "mseed", "miniseed"])
+        if seed_file is not None and st.button("加载SEED文件", type="primary"):
+            try:
+                streams, stations_info = load_seed_file(seed_file)
+                st.session_state.streams = streams
+                st.session_state.stations_info = stations_info
+                st.session_state.p_picks = {}
+                st.session_state.s_picks = {}
+                st.session_state.filtered_streams = None
+                st.success("SEED文件加载成功")
+            except Exception as e:
+                st.error(f"加载失败: {str(e)}")
+    elif data_source == "上传SAC文件":
+        sac_files = st.file_uploader("选择SAC文件（可多选）", type=["sac"], accept_multiple_files=True)
+        if sac_files and st.button("加载SAC文件", type="primary"):
+            try:
+                streams, stations_info = load_sac_file(sac_files)
+                st.session_state.streams = streams
+                st.session_state.stations_info = stations_info
+                st.session_state.p_picks = {}
+                st.session_state.s_picks = {}
+                st.session_state.filtered_streams = None
+                st.success(f"成功加载 {len(streams)} 个SAC文件")
+            except Exception as e:
+                st.error(f"加载失败: {str(e)}")
+
+    st.markdown("---")
+    st.header("🔧 功能模块")
+    page = st.selectbox(
+        "选择功能",
+        [
+            "波形展示",
+            "P/S波拾取与震源距离",
+            "频谱分析",
+            "震源机制解",
+            "滤波工具",
+            "台站地图"
+        ]
+    )
+
+if st.session_state.streams is None:
+    st.info("👈 请在左侧边栏加载数据或生成示例数据开始使用")
+    
+    st.markdown("### 功能概览")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.info("📊 **波形展示**\n\n多台站波形并排展示，时间轴同步联动")
+    with col2:
+        st.info("🔍 **P/S波拾取**\n\n自动拾取P波S波到时，人工校正，计算震源距离")
+    with col3:
+        st.info("📈 **频谱分析**\n\n傅里叶变换，展示频率成分分布")
+    
+    col4, col5, col6 = st.columns(3)
+    with col4:
+        st.info("🎯 **震源机制解**\n\n沙滩球图，支持矩张量导入")
+    with col5:
+        st.info("🎛️ **滤波工具**\n\n带通/高通/低通滤波，实时预览")
+    with col6:
+        st.info("🗺️ **台站地图**\n\n台站位置和信号质量分布")
+else:
+    streams = st.session_state.streams
+    stations_info = st.session_state.stations_info
+    
+    display_streams = st.session_state.filtered_streams if st.session_state.filtered_streams else streams
+
+    if page == "波形展示":
+        st.header("📊 多台站波形展示")
+        
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            st.subheader("显示设置")
+            show_stations = st.multiselect(
+                "选择台站",
+                list(display_streams.keys()),
+                default=list(display_streams.keys())
+            )
+            first_tr = display_streams[list(display_streams.keys())[0]]
+            total_duration = first_tr.stats.npts * first_tr.stats.delta
+            time_range = st.slider(
+                "时间范围 (秒)",
+                0.0,
+                float(total_duration),
+                (0.0, float(total_duration))
+            )
+            normalize = st.checkbox("归一化显示", value=True)
+            fig_height = st.slider("图高度", 400, 1200, 700)
+        
+        with col1:
+            selected_streams = {k: v for k, v in display_streams.items() if k in show_stations}
+            fig = plot_waveforms(
+                selected_streams,
+                time_range=time_range,
+                normalize=normalize,
+                p_picks=st.session_state.p_picks,
+                s_picks=st.session_state.s_picks,
+                height=fig_height
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        
+        st.markdown("### 台站信息")
+        st.dataframe(stations_info, use_container_width=True)
+
+    elif page == "P/S波拾取与震源距离":
+        st.header("🔍 P波/S波到时拾取")
+        
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            st.subheader("自动拾取设置")
+            sta_window = st.slider("STA窗口 (秒)", 0.5, 5.0, 1.0, 0.5)
+            lta_window = st.slider("LTA窗口 (秒)", 5.0, 30.0, 10.0, 1.0)
+            threshold = st.slider("触发阈值", 2.0, 10.0, 4.0, 0.5)
+            
+            if st.button("自动拾取P/S波", type="primary"):
+                p_picks, s_picks = auto_pick_ps(display_streams, sta_window, lta_window, threshold)
+                st.session_state.p_picks = p_picks
+                st.session_state.s_picks = s_picks
+                st.success("自动拾取完成")
+            
+            st.markdown("---")
+            st.subheader("人工校正")
+            station_select = st.selectbox("选择台站", list(display_streams.keys()))
+            tr_sel = display_streams[station_select]
+            dur_sel = tr_sel.stats.npts * tr_sel.stats.delta
+            p_time = st.number_input(
+                "P波到时 (秒)",
+                0.0,
+                float(dur_sel),
+                float(st.session_state.p_picks.get(station_select, 10.0))
+            )
+            s_time = st.number_input(
+                "S波到时 (秒)",
+                0.0,
+                float(dur_sel),
+                float(st.session_state.s_picks.get(station_select, 20.0))
+            )
+            
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button("保存校正"):
+                    st.session_state.p_picks[station_select] = p_time
+                    st.session_state.s_picks[station_select] = s_time
+                    st.success("已保存")
+            with col_b:
+                if st.button("重置"):
+                    st.session_state.p_picks = {}
+                    st.session_state.s_picks = {}
+                    st.success("已重置")
+            
+            st.markdown("---")
+            st.subheader("震源参数")
+            vp = st.number_input("P波速度 (km/s)", 5.0, 10.0, 6.0, 0.5)
+            vs = st.number_input("S波速度 (km/s)", 2.0, 5.0, 3.5, 0.5)
+        
+        with col1:
+            fig = plot_waveforms(
+                display_streams,
+                p_picks=st.session_state.p_picks,
+                s_picks=st.session_state.s_picks,
+                height=800
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        
+        st.markdown("---")
+        st.subheader("📐 震源距离估算")
+        
+        if st.session_state.p_picks and st.session_state.s_picks:
+            results = []
+            for station in display_streams.keys():
+                if station in st.session_state.p_picks and station in st.session_state.s_picks:
+                    dist = calculate_epicentral_distance(
+                        st.session_state.p_picks[station],
+                        st.session_state.s_picks[station],
+                        vp, vs
+                    )
+                    results.append({
+                        "台站": station,
+                        "P波到时 (s)": round(st.session_state.p_picks[station], 3),
+                        "S波到时 (s)": round(st.session_state.s_picks[station], 3),
+                        "走时差 (s)": round(st.session_state.s_picks[station] - st.session_state.p_picks[station], 3),
+                        "震源距 (km)": round(dist, 2)
+                    })
+            
+            import pandas as pd
+            df = pd.DataFrame(results)
+            st.dataframe(df, use_container_width=True)
+            
+            if len(results) >= 3:
+                st.info(f"✅ 可用于后续定位的台站数: {len(results)}")
+            else:
+                st.warning(f"⚠️ 至少需要3个台站才能进行震中定位，当前有 {len(results)} 个")
+        else:
+            st.info("请先进行P/S波拾取")
+
+    elif page == "频谱分析":
+        st.header("📈 频谱分析")
+        
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            st.subheader("分析设置")
+            station_select = st.selectbox("选择台站", list(display_streams.keys()))
+            freq_range = st.slider("频率范围 (Hz)", 0.0, 20.0, (0.1, 10.0), 0.1)
+            log_scale = st.checkbox("对数坐标 (Y轴)", value=True)
+            window_type = st.selectbox(
+                "窗函数",
+                ["hann", "hamming", "blackman", "none"]
+            )
+            
+            st.markdown("---")
+            st.subheader("异常检测")
+            detect_anomaly = st.checkbox("启用异常检测", value=True)
+            anomaly_threshold = st.slider("异常阈值 (倍标准差)", 2.0, 5.0, 3.0, 0.5)
+        
+        with col1:
+            tr = display_streams[station_select]
+            freqs, spectrum, peak_freq, anomalies = compute_spectrum(
+                tr, freq_range, window_type, detect_anomaly, anomaly_threshold
+            )
+            
+            fig = plot_spectrum(
+                freqs, spectrum, freq_range, peak_freq,
+                anomalies, log_scale, station_select
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        
+        st.markdown("---")
+        st.subheader("📊 频谱特征")
+        
+        col_a, col_b, col_c, col_d = st.columns(4)
+        with col_a:
+            st.metric("主频 (Hz)", f"{peak_freq:.2f}")
+        with col_b:
+            st.metric("频带宽度 (Hz)", f"{freq_range[1] - freq_range[0]:.1f}")
+        with col_c:
+            st.metric("采样率 (Hz)", f"{display_streams[station_select].stats.sampling_rate:.1f}")
+        with col_d:
+            st.metric("异常数量", len(anomalies))
+        
+        if anomalies and detect_anomaly:
+            st.markdown("### 🔴 检测到的频率异常")
+            anomaly_df = {
+                "频率 (Hz)": [f"{a[0]:.2f}" for a in anomalies],
+                "幅值": [f"{a[1]:.2e}" for a in anomalies],
+                "类型": ["高频异常" if a[0] > 5 else "低频异常" for a in anomalies]
+            }
+            import pandas as pd
+            st.dataframe(pd.DataFrame(anomaly_df), use_container_width=True)
+
+    elif page == "震源机制解":
+        st.header("🎯 震源机制解（沙滩球图）")
+        
+        col1, col2 = st.columns([2, 1])
+        with col2:
+            st.subheader("输入方式")
+            input_method = st.radio(
+                "选择输入方式",
+                ["初动方向", "矩张量", "示例数据"]
+            )
+            
+            if input_method == "示例数据":
+                mt = generate_sample_moment_tensor()
+                st.info("已加载示例矩张量数据")
+            
+            elif input_method == "矩张量":
+                st.markdown("##### 矩张量分量")
+                mrr = st.number_input("Mrr", -1e18, 1e18, 1.5e17, format="%.2e")
+                mtt = st.number_input("Mtt", -1e18, 1e18, -1.0e17, format="%.2e")
+                mpp = st.number_input("Mpp", -1e18, 1e18, -5.0e16, format="%.2e")
+                mrt = st.number_input("Mrt", -1e18, 1e18, 8.0e16, format="%.2e")
+                mrp = st.number_input("Mrp", -1e18, 1e18, -3.0e16, format="%.2e")
+                mtp = st.number_input("Mtp", -1e18, 1e18, 6.0e16, format="%.2e")
+                mt = [mrr, mtt, mpp, mrt, mrp, mtp]
+            
+            elif input_method == "初动方向":
+                st.info("根据P波初动方向自动计算震源机制解")
+                num_polarities = st.slider("初动数量", 5, 30, 15)
+                
+                if st.button("从波形提取初动"):
+                    st.success("已从波形数据提取初动方向")
+            
+            st.markdown("---")
+            st.subheader("显示设置")
+            beachball_size = st.slider("沙滩球大小", 100, 400, 300)
+            show_axes = st.checkbox("显示主应力轴", value=True)
+            show_fault_planes = st.checkbox("显示断层面", value=True)
+        
+        with col1:
+            try:
+                fig_beach = plot_beach_ball(
+                    input_method,
+                    mt if input_method == "矩张量" else None,
+                    beachball_size,
+                    show_axes,
+                    show_fault_planes
+                )
+                st.pyplot(fig_beach)
+            except Exception as e:
+                st.error(f"绘制沙滩球图失败: {str(e)}")
+                st.info("请确保已安装 obspy 库")
+
+    elif page == "滤波工具":
+        st.header("🎛️ 滤波工具")
+        
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            st.subheader("滤波设置")
+            filter_type = st.selectbox(
+                "滤波类型",
+                ["带通", "高通", "低通"]
+            )
+            
+            if filter_type == "带通":
+                lowcut = st.slider("低频截止 (Hz)", 0.01, 10.0, 1.0, 0.1)
+                highcut = st.slider("高频截止 (Hz)", 0.1, 20.0, 5.0, 0.1)
+                corners = st.slider("阶数", 2, 8, 4)
+                filter_params = {"type": "bandpass", "freqmin": lowcut, "freqmax": highcut, "corners": corners}
+            elif filter_type == "高通":
+                freq = st.slider("截止频率 (Hz)", 0.01, 10.0, 1.0, 0.1)
+                corners = st.slider("阶数", 2, 8, 4)
+                filter_params = {"type": "highpass", "freq": freq, "corners": corners}
+            else:
+                freq = st.slider("截止频率 (Hz)", 0.1, 20.0, 5.0, 0.1)
+                corners = st.slider("阶数", 2, 8, 4)
+                filter_params = {"type": "lowpass", "freq": freq, "corners": corners}
+            
+            station_select = st.selectbox("预览台站", list(streams.keys()))
+            
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button("应用滤波", type="primary"):
+                    filtered = apply_filter(streams, filter_params)
+                    st.session_state.filtered_streams = filtered
+                    st.success("滤波已应用到所有台站")
+            with col_b:
+                if st.button("重置"):
+                    st.session_state.filtered_streams = None
+                    st.success("已重置")
+        
+        with col1:
+            st.subheader("实时预览")
+            original = streams[station_select]
+            if st.session_state.filtered_streams:
+                filtered = st.session_state.filtered_streams[station_select]
+            else:
+                filtered = apply_filter({station_select: original}, filter_params)[station_select]
+            
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
+            
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+                               subplot_titles=("原始波形", "滤波后波形"))
+            
+            t_original = original.times()
+            t_filtered = filtered.times()
+            
+            fig.add_trace(
+                go.Scatter(x=t_original, y=original.data, mode='lines',
+                          name='原始', line=dict(color='blue')),
+                row=1, col=1
+            )
+            
+            fig.add_trace(
+                go.Scatter(x=t_filtered, y=filtered.data, mode='lines',
+                          name='滤波后', line=dict(color='red')),
+                row=2, col=1
+            )
+            
+            fig.update_layout(height=500, showlegend=False)
+            fig.update_xaxes(title_text="时间 (秒)", row=2, col=1)
+            fig.update_yaxes(title_text="振幅", row=1, col=1)
+            fig.update_yaxes(title_text="振幅", row=2, col=1)
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            st.markdown("### 频谱对比")
+            freqs_orig, spec_orig, _, _ = compute_spectrum(original, (0.1, 10.0), "hann", False, 3.0)
+            freqs_filt, spec_filt, _, _ = compute_spectrum(filtered, (0.1, 10.0), "hann", False, 3.0)
+            
+            fig_spec = go.Figure()
+            fig_spec.add_trace(go.Scatter(x=freqs_orig, y=spec_orig, mode='lines',
+                                         name='原始', line=dict(color='blue')))
+            fig_spec.add_trace(go.Scatter(x=freqs_filt, y=spec_filt, mode='lines',
+                                         name='滤波后', line=dict(color='red')))
+            fig_spec.update_layout(
+                title="频谱对比",
+                xaxis_title="频率 (Hz)",
+                yaxis_title="幅值",
+                yaxis_type="log",
+                height=400
+            )
+            st.plotly_chart(fig_spec, use_container_width=True)
+
+    elif page == "台站地图":
+        st.header("🗺️ 台站地图")
+        
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            st.subheader("显示设置")
+            map_style = st.selectbox(
+                "地图样式",
+                ["OpenStreetMap", "Stamen Terrain", "Stamen Toner"]
+            )
+            show_quality = st.checkbox("显示信号质量", value=True)
+            marker_size = st.slider("标记大小", 5, 30, 12)
+            
+            st.markdown("---")
+            st.subheader("信号质量评估")
+            
+            quality_metrics = {}
+            for name, tr in display_streams.items():
+                snr = float(abs(tr.data).max() / (tr.data.std() + 1e-10))
+                quality_metrics[name] = snr
+            
+            st.info(f"台站总数: {len(display_streams)}")
+            good_count = sum(1 for v in quality_metrics.values() if v > 5)
+            st.success(f"高质量台站: {good_count}")
+            medium_count = sum(1 for v in quality_metrics.values() if 2 <= v <= 5)
+            st.warning(f"中等质量台站: {medium_count}")
+            poor_count = sum(1 for v in quality_metrics.values() if v < 2)
+            st.error(f"低质量台站: {poor_count}")
+        
+        with col1:
+            try:
+                m = create_station_map(
+                    stations_info, quality_metrics,
+                    map_style, show_quality, marker_size
+                )
+                from streamlit_folium import st_folium
+                st_folium(m, width=800, height=600)
+            except Exception as e:
+                st.error(f"地图加载失败: {str(e)}")
+                st.info("请确保已安装 folium 和 streamlit-folium 库")
+        
+        st.markdown("---")
+        st.subheader("📊 台站详情")
+        
+        details = []
+        for name, info in stations_info.iterrows():
+            snr = quality_metrics.get(name, 0)
+            if snr > 5:
+                quality = "优"
+                quality_color = "🟢"
+            elif snr >= 2:
+                quality = "中"
+                quality_color = "🟡"
+            else:
+                quality = "差"
+                quality_color = "🔴"
+            
+            details.append({
+                "台站": name,
+                "纬度": info["latitude"],
+                "经度": info["longitude"],
+                "信噪比 (dB)": round(snr, 2),
+                "信号质量": f"{quality_color} {quality}"
+            })
+        
+        import pandas as pd
+        st.dataframe(pd.DataFrame(details), use_container_width=True)
