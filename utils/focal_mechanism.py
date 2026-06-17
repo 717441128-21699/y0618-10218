@@ -812,3 +812,339 @@ def first_motion_to_dataframe(polarities):
         })
     
     return pd.DataFrame(data)
+
+
+def create_complete_report_figure(mt, polarities, excluded_stations=None, 
+                                  file_info=None, mw=None, size_inches=(11, 15)):
+    """生成完整的事件报告Figure（用于预览和PDF导出）
+    
+    包含：标题+沙滩球图+矩张量信息+初动极性表+排除台站说明
+    """
+    from datetime import datetime
+    if excluded_stations is None:
+        excluded_stations = []
+    
+    if mw is None and mt is not None:
+        mw = calculate_moment_magnitude(mt)
+    
+    fig = plt.figure(figsize=size_inches)
+    gs = fig.add_gridspec(6, 4, hspace=0.45, wspace=0.25)
+    
+    fig.suptitle(
+        "地震事件分析报告",
+        fontsize=18, fontweight='bold', y=0.99
+    )
+    fig.text(0.5, 0.965, f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+             ha='center', fontsize=9, color='gray')
+    
+    ax_beach = fig.add_subplot(gs[0:3, 1:3])
+    if mt is not None:
+        ax_beach.set_title("矩张量沙滩球图", fontsize=11, fontweight='bold', pad=8)
+        try:
+            _plot_beachball_to_axes(mt, ax_beach, show_axes=True)
+        except Exception:
+            ax_beach.text(0.5, 0.5, '绘制失败', ha='center', va='center')
+    elif polarities:
+        ax_beach.set_title("初动极性沙滩球图", fontsize=11, fontweight='bold', pad=8)
+        try:
+            _plot_fm_to_axes(polarities, ax_beach)
+        except Exception:
+            ax_beach.text(0.5, 0.5, '绘制失败', ha='center', va='center')
+    else:
+        ax_beach.text(0.5, 0.5, '暂无数据', ha='center', va='center', fontsize=12)
+    ax_beach.axis('off')
+    
+    ax_mt = fig.add_subplot(gs[0:2, 0])
+    ax_mt.axis('off')
+    ax_mt.set_title("矩张量信息", fontsize=10, fontweight='bold', pad=6)
+    mt_text = []
+    if mt is not None:
+        mt = np.array(mt)
+        m0 = calculate_scalar_moment(mt)
+        labels = ['Mrr', 'Mtt', 'Mpp', 'Mrt', 'Mrp', 'Mtp']
+        for lbl, val in zip(labels, mt):
+            mt_text.append(f"{lbl}: {val:.3e} N·m")
+        mt_text.append("")
+        mt_text.append(f"M₀ (标量矩): {m0:.3e} N·m")
+        mt_text.append(f"Mw (矩震级): {mw:.2f}" if mw is not None else "Mw: N/A")
+    else:
+        mt_text.append("未提供矩张量")
+        if mw is not None:
+            mt_text.append(f"Mw (矩震级): {mw:.2f}")
+    ax_mt.text(0.03, 0.97, '\n'.join(mt_text),
+               ha='left', va='top', fontsize=8.5, family='monospace',
+               transform=ax_mt.transAxes)
+    
+    ax_file = fig.add_subplot(gs[2, 0])
+    ax_file.axis('off')
+    ax_file.set_title("文件来源信息", fontsize=10, fontweight='bold', pad=6)
+    file_text = []
+    if file_info:
+        for k, v in file_info.items():
+            file_text.append(f"{k}: {v}")
+    else:
+        file_text.append("手动输入/示例数据")
+    if not file_text:
+        file_text.append("无附加信息")
+    ax_file.text(0.03, 0.97, '\n'.join(file_text),
+                 ha='left', va='top', fontsize=8,
+                 transform=ax_file.transAxes)
+    
+    ax_excl = fig.add_subplot(gs[0:3, 3])
+    ax_excl.axis('off')
+    ax_excl.set_title("台站排除说明", fontsize=10, fontweight='bold', pad=6)
+    excl_text = []
+    if excluded_stations:
+        excl_text.append(f"共排除 {len(excluded_stations)} 个台站：")
+        excl_text.append("")
+        for s in excluded_stations:
+            excl_text.append(f"  • {s}")
+        excl_text.append("")
+        excl_text.append("理由：信号质量差/初动")
+        excl_text.append("极性不可靠，从机制解")
+        excl_text.append("计算中剔除。")
+    else:
+        excl_text.append("未排除任何台站")
+    ax_excl.text(0.03, 0.97, '\n'.join(excl_text),
+                 ha='left', va='top', fontsize=8.5,
+                 transform=ax_excl.transAxes)
+    
+    ax_pol = fig.add_subplot(gs[3:6, :])
+    ax_pol.axis('off')
+    ax_pol.set_title("台站初动极性记录表", fontsize=11, fontweight='bold', pad=6)
+    
+    col_labels = ['台站', '方位角(°)', '倾角(°)', '极性', '质量', '是否排除']
+    cell_data = []
+    active_pols = []
+    for item in polarities:
+        if len(item) >= 5:
+            name, az, pl, pol, qual = item[:5]
+        elif len(item) == 4:
+            name, az, pl, pol = item
+            qual = 'unknown'
+        else:
+            name, az, pl, pol = '', float(item[0]), float(item[1]), item[2]
+            qual = 'unknown'
+        is_excl = name in excluded_stations
+        pol_cn = '压缩(C)' if pol in ['compressional', 'C', 'c', '+', 1, 'up'] else '拉张(D)'
+        qual_cn = {'good': '优', 'medium': '中', 'poor': '差', 'unknown': '未知',
+                   'manual': '人工'}.get(qual, str(qual))
+        excl_cn = '是' if is_excl else '否'
+        cell_data.append([name, f"{float(az):.1f}", f"{float(pl):.1f}",
+                          pol_cn, qual_cn, excl_cn])
+        if not is_excl:
+            active_pols.append(True)
+        else:
+            active_pols.append(False)
+    
+    if not cell_data:
+        cell_data.append(['无数据', '', '', '', '', ''])
+    
+    col_colors = ['#e8f0fe'] * len(col_labels)
+    row_colors = []
+    for i, ap in enumerate(active_pols):
+        if ap:
+            row_colors.append('white')
+        else:
+            row_colors.append(['#fff3e0'] * len(col_labels))
+    
+    table = ax_pol.table(
+        cellText=cell_data,
+        colLabels=col_labels,
+        colColours=col_colors,
+        rowColours=row_colors if any(not a for a in active_pols) else None,
+        loc='center',
+        cellLoc='center'
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1, 1.4)
+    
+    active = sum(1 for x in active_pols if x)
+    fig.text(0.5, 0.02, f"统计：总计 {len(cell_data)} 个台站，其中有效 {active} 个，已排除 "
+                       f"{len(cell_data) - active} 个",
+             ha='center', fontsize=9, style='italic')
+    
+    return fig
+
+
+def _plot_beachball_to_axes(mt, ax, show_axes=True):
+    """在指定axes上绘制矩张量沙滩球（复用现有逻辑）"""
+    mt = np.array(mt, dtype=float)
+    ntheta = 200
+    nphi = 400
+    theta_grid = np.linspace(0, np.pi, ntheta)
+    phi_grid = np.linspace(0, 2 * np.pi, nphi)
+    theta_mesh, phi_mesh = np.meshgrid(theta_grid, phi_grid)
+    radiation = compute_radiation_pattern(mt)
+    rp_vals = radiation(theta_mesh, phi_mesh)
+    
+    X = np.zeros_like(theta_mesh)
+    Y = np.zeros_like(theta_mesh)
+    for i in range(theta_mesh.shape[0]):
+        for j in range(theta_mesh.shape[1]):
+            az = np.degrees(phi_mesh[i, j])
+            pl = 90 - np.degrees(theta_mesh[i, j])
+            if pl < 0:
+                pl = 0
+            eq = np.sqrt(2) * np.sin(np.radians(90 - pl) / 2)
+            X[i, j] = eq * np.sin(np.radians(az))
+            Y[i, j] = eq * np.cos(np.radians(az))
+    
+    from matplotlib.colors import Normalize
+    from matplotlib import cm
+    max_abs = np.max(np.abs(rp_vals)) if rp_vals.size else 1
+    cmap = cm.get_cmap('RdBu_r')
+    norm = Normalize(vmin=-max_abs, vmax=max_abs)
+    ax.pcolormesh(X, Y, rp_vals, cmap=cmap, norm=norm, shading='auto', zorder=1)
+    
+    try:
+        nodal_lines = find_nodal_lines(mt)
+        for nl in nodal_lines:
+            if nl and len(nl) > 0:
+                nl = np.array(nl)
+                x_nl, y_nl = equal_area_projection(nl[:, 0], nl[:, 1])
+                if len(x_nl) > 1:
+                    ax.plot(x_nl, y_nl, 'k-', linewidth=1.8, zorder=3)
+    except Exception:
+        pass
+    
+    circle = Circle((0, 0), 1, fill=False, edgecolor='black', linewidth=2, zorder=4)
+    ax.add_patch(circle)
+    ax.plot([-1, 1], [0, 0], 'k-', linewidth=0.5, alpha=0.3, zorder=2)
+    ax.plot([0, 0], [-1, 1], 'k-', linewidth=0.5, alpha=0.3, zorder=2)
+    ax.set_xlim(-1.15, 1.15)
+    ax.set_ylim(-1.15, 1.15)
+    ax.set_aspect('equal')
+    
+    if show_axes:
+        try:
+            M = np.array([[mt[0], mt[3], mt[4]],
+                         [mt[3], mt[1], mt[5]],
+                         [mt[4], mt[5], mt[2]]])
+            eigenvalues, eigenvectors = np.linalg.eigh(M)
+            sorted_idx = np.argsort(eigenvalues)
+            T_idx = sorted_idx[-1]
+            P_idx = sorted_idx[0]
+            T_vec = eigenvectors[:, T_idx]
+            P_vec = eigenvectors[:, P_idx]
+            T_plunge = np.degrees(np.arcsin(np.clip(T_vec[2], -1, 1)))
+            T_az = np.degrees(np.arctan2(T_vec[1], T_vec[0])) % 360
+            P_plunge = np.degrees(np.arcsin(np.clip(P_vec[2], -1, 1)))
+            P_az = np.degrees(np.arctan2(P_vec[1], P_vec[0])) % 360
+            if T_plunge < 0:
+                T_plunge = -T_plunge
+                T_az = (T_az + 180) % 360
+            if P_plunge < 0:
+                P_plunge = -P_plunge
+                P_az = (P_az + 180) % 360
+            T_x, T_y = equal_area_projection(T_az, 90 - T_plunge)
+            P_x, P_y = equal_area_projection(P_az, 90 - P_plunge)
+            ax.plot(T_x, T_y, 'wo', markersize=9, markeredgecolor='black',
+                    markeredgewidth=1.5, zorder=6, label='T轴')
+            ax.plot(P_x, P_y, 's', color='white', markersize=8, markeredgecolor='black',
+                    markeredgewidth=1.5, markerfacecolor='black', zorder=6, label='P轴')
+        except Exception:
+            pass
+
+
+def _plot_fm_to_axes(polarities, ax):
+    """在指定axes上绘制初动极性沙滩球"""
+    circle = Circle((0, 0), 1, fill=True, facecolor='#f0f0f0',
+                   edgecolor='black', linewidth=2.5, zorder=1)
+    ax.add_patch(circle)
+    
+    for item in polarities:
+        if len(item) >= 4:
+            name = item[0]
+            az = float(item[1])
+            pl = float(item[2])
+            pol = item[3]
+        else:
+            name = ''
+            az = float(item[0])
+            pl = float(item[1])
+            pol = item[2]
+        
+        x, y = equal_area_projection(az, pl)
+        if x**2 + y**2 > 1.05:
+            continue
+        
+        if pol in ['compressional', 'C', 'c', '+', 1, 'up']:
+            ax.plot(x, y, 'o', color='black', markersize=7,
+                   markeredgecolor='black', markeredgewidth=1, zorder=5)
+        else:
+            ax.plot(x, y, 'o', color='white', markersize=7,
+                   markeredgecolor='black', markeredgewidth=1.5, zorder=5)
+    
+    ax.plot([-1, 1], [0, 0], 'k-', linewidth=0.5, alpha=0.3, zorder=2)
+    ax.plot([0, 0], [-1, 1], 'k-', linewidth=0.5, alpha=0.3, zorder=2)
+    ax.set_xlim(-1.15, 1.15)
+    ax.set_ylim(-1.15, 1.15)
+    ax.set_aspect('equal')
+
+
+def save_report_to_pdf(report_fig, beachball_fig=None):
+    """将报告Figure保存为PDF字节流"""
+    import io
+    from matplotlib.backends.backend_pdf import PdfPages
+    
+    buf = io.BytesIO()
+    with PdfPages(buf) as pdf:
+        pdf.savefig(report_fig, bbox_inches='tight', facecolor='white')
+        if beachball_fig is not None:
+            pdf.savefig(beachball_fig, bbox_inches='tight', facecolor='white')
+    buf.seek(0)
+    return buf
+
+
+def create_report_zip_package(report_fig, beachball_fig, polarities, mt, 
+                              excluded_stations=None, mw=None, file_info=None):
+    """生成打包ZIP：PDF报告 + 沙滩球PNG + CSV数据 + JSON报告"""
+    import io
+    import zipfile
+    
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        try:
+            pdf_buf = save_report_to_pdf(report_fig, beachball_fig)
+            zf.writestr("event_report.pdf", pdf_buf.getvalue())
+        except Exception:
+            pass
+        
+        try:
+            if beachball_fig is not None:
+                png_buf = save_beachball_to_png(beachball_fig)
+                zf.writestr("beachball.png", png_buf.getvalue())
+        except Exception:
+            pass
+        
+        try:
+            csv_buf = create_first_motion_csv(polarities, mt, mw, file_info)
+            zf.writestr("first_motions_and_mt.csv", csv_buf.getvalue().encode('utf-8-sig'))
+        except Exception:
+            pass
+        
+        try:
+            json_str = create_event_report_json(mt, polarities, mw, file_info)
+            zf.writestr("event_report.json", json_str.encode('utf-8'))
+        except Exception:
+            pass
+        
+        if excluded_stations:
+            note_lines = [
+                "台站排除说明",
+                "=" * 40,
+                "",
+                f"共排除 {len(excluded_stations)} 个台站：",
+                ""
+            ]
+            for s in excluded_stations:
+                note_lines.append(f"  - {s}")
+            note_lines.append("")
+            note_lines.append("排除的台站已从机制解计算和沙滩球图中移除。")
+            note_lines.append("可在波形展示、台站地图等页面恢复。")
+            zf.writestr("README_excluded_stations.txt", '\n'.join(note_lines).encode('utf-8'))
+    
+    zip_buf.seek(0)
+    return zip_buf

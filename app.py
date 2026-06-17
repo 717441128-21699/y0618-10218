@@ -26,7 +26,10 @@ from utils.focal_mechanism import (
     calculate_moment_magnitude,
     save_beachball_to_png,
     create_first_motion_csv,
-    create_event_report_json
+    create_event_report_json,
+    create_complete_report_figure,
+    save_report_to_pdf,
+    create_report_zip_package
 )
 from utils.filter import apply_filter
 from utils.station_map import create_station_map
@@ -106,6 +109,7 @@ with st.sidebar:
             "P/S波拾取与震源距离",
             "频谱分析",
             "频谱-滤波对比",
+            "台站质量检查",
             "震源机制解",
             "滤波工具",
             "台站地图"
@@ -508,6 +512,196 @@ else:
                     })
                 st.dataframe(pd.DataFrame(comp_data), use_container_width=True, hide_index=True)
 
+    elif page == "台站质量检查":
+        st.header("🔍 台站质量检查 · 对照视图")
+        st.caption("选中台站后，波形、拾取、频谱和初动信息集中展示，方便一路检查质量并决定是否排除")
+        
+        all_stations = list(display_streams.keys())
+        
+        col_sel1, col_sel2, col_sel3 = st.columns([2, 1, 1])
+        with col_sel1:
+            default_idx = 0
+            if st.session_state.selected_station and st.session_state.selected_station in all_stations:
+                default_idx = all_stations.index(st.session_state.selected_station)
+                st.info(f"📌 联动选中台站（来自地图或其他页面）: **{st.session_state.selected_station}**")
+            
+            station_check = st.selectbox(
+                "选择要检查的台站",
+                all_stations,
+                index=default_idx,
+                key="qc_station_select"
+            )
+            st.session_state.selected_station = station_check
+        
+        with col_sel2:
+            is_excluded = station_check in st.session_state.excluded_stations
+            if is_excluded:
+                st.warning(f"⚠️ 该台站已被排除")
+                if st.button("✅ 恢复该台站", use_container_width=True):
+                    st.session_state.excluded_stations.remove(station_check)
+                    st.success(f"已恢复: {station_check}")
+                    st.rerun()
+            else:
+                if st.button("🚫 排除该台站", use_container_width=True, type="secondary"):
+                    st.session_state.excluded_stations.append(station_check)
+                    st.warning(f"已排除: {station_check}")
+                    st.rerun()
+        
+        with col_sel3:
+            tr_qc = display_streams[station_check]
+            snr_qc = float(abs(tr_qc.data).max() / (tr_qc.data.std() + 1e-10))
+            if snr_qc > 5:
+                st.success(f"SNR: {snr_qc:.1f}  质量优 🟢")
+            elif snr_qc >= 2:
+                st.warning(f"SNR: {snr_qc:.1f}  质量中 🟡")
+            else:
+                st.error(f"SNR: {snr_qc:.1f}  质量差 🔴")
+        
+        st.markdown("---")
+        
+        col_qc1, col_qc2 = st.columns([2, 1])
+        
+        with col_qc1:
+            st.subheader(f"📐 波形 & 拾取 ({station_check})")
+            
+            t = np.array(tr_qc.times())
+            d = np.array(tr_qc.data)
+            
+            import plotly.graph_objects as go
+            fig_w = go.Figure()
+            fig_w.add_trace(go.Scatter(x=t, y=d, mode='lines', name=station_check,
+                                     line=dict(color='#1f77b4', width=1.2)))
+            
+            p_qc = st.session_state.p_picks.get(station_check)
+            s_qc = st.session_state.s_picks.get(station_check)
+            if p_qc:
+                fig_w.add_vline(x=p_qc, line_dash="dash", line_color="green", line_width=2,
+                               annotation_text=f"P = {p_qc:.2f}s", annotation_font_color="green")
+            if s_qc:
+                fig_w.add_vline(x=s_qc, line_dash="dash", line_color="red", line_width=2,
+                               annotation_text=f"S = {s_qc:.2f}s", annotation_font_color="red")
+            
+            fig_w.update_layout(
+                xaxis_title="时间 (秒)",
+                yaxis_title="振幅",
+                height=320,
+                margin=dict(l=10, r=10, t=10, b=40),
+                showlegend=False,
+                template="plotly_white"
+            )
+            st.plotly_chart(fig_w, use_container_width=True)
+            
+            st.subheader(f"📈 频谱 ({station_check})")
+            freq_r = (0.1, 10.0)
+            freqs_qc, spec_qc, peak_qc, anom_qc = compute_spectrum(
+                tr_qc, freq_r, "hann", True, 3.0
+            )
+            fig_s = plot_spectrum(freqs_qc, spec_qc, freq_r, peak_qc,
+                                  anom_qc, True, station_check)
+            fig_s.update_layout(height=280, margin=dict(l=10, r=10, t=30, b=40))
+            st.plotly_chart(fig_s, use_container_width=True)
+        
+        with col_qc2:
+            st.subheader("📋 台站详情")
+            
+            st.markdown("##### 基础信息")
+            det_cols1, det_cols2 = st.columns(2)
+            with det_cols1:
+                st.metric("采样率", f"{tr_qc.stats.sampling_rate:.0f} Hz")
+                st.metric("数据点数", f"{tr_qc.stats.npts}")
+                st.metric("主频", f"{peak_qc:.2f} Hz")
+            with det_cols2:
+                st.metric("P到时", f"{p_qc:.2f}s" if p_qc else "未拾取")
+                st.metric("S到时", f"{s_qc:.2f}s" if s_qc else "未拾取")
+                st.metric("异常数", f"{len(anom_qc)} 个")
+            
+            st.markdown("---")
+            st.markdown("##### 初动极性")
+            
+            pol_info_qc = None
+            for p in st.session_state.polarities:
+                if p[0] == station_check:
+                    pol_info_qc = p
+                    break
+            
+            if pol_info_qc:
+                pol_cn_qc = "压缩 (● 黑点)" if pol_info_qc[3] in ['compressional', 'C', 'c', '+', 1, 'up'] else "拉张 (○ 白圈)"
+                qual_map_qc = {'good': '优 🟢', 'medium': '中 🟡', 'poor': '差 🔴',
+                              'manual': '人工 ✏️'}
+                qual_disp_qc = qual_map_qc.get(pol_info_qc[4], str(pol_info_qc[4]))
+                pc1, pc2, pc3 = st.columns(3)
+                with pc1:
+                    st.metric("极性", pol_cn_qc)
+                with pc2:
+                    st.metric("方位角", f"{float(pol_info_qc[1]):.1f}°")
+                with pc3:
+                    st.metric("倾角", f"{float(pol_info_qc[2]):.1f}°")
+                st.info(f"初动质量: **{qual_disp_qc}**")
+            else:
+                st.info("⚠️ 该台站尚未提取初动极性")
+                st.caption("请去「震源机制解 → 初动方向」页面点击自动提取")
+            
+            if stations_info is not None and station_check in stations_info.index:
+                info_qc = stations_info.loc[station_check]
+                st.markdown("---")
+                st.markdown("##### 地理信息")
+                geo1, geo2 = st.columns(2)
+                with geo1:
+                    st.metric("纬度", f"{info_qc['latitude']:.3f}°")
+                with geo2:
+                    st.metric("经度", f"{info_qc['longitude']:.3f}°")
+                if 'distance_km' in info_qc.index and info_qc['distance_km'] > 0:
+                    st.metric("震源距", f"{info_qc['distance_km']:.1f} km")
+            
+            st.markdown("---")
+            st.markdown("##### 机制解参与状态")
+            if is_excluded:
+                st.error("❌ 已排除 — 不会出现在沙滩球图和报告中")
+            else:
+                st.success("✅ 已参与 — 用于机制解计算")
+            
+            if len(st.session_state.excluded_stations) > 0:
+                with st.expander(f"查看已排除的台站 ({len(st.session_state.excluded_stations)})"):
+                    for ex in list(st.session_state.excluded_stations):
+                        col_r1, col_r2 = st.columns([3, 1])
+                        with col_r1:
+                            st.text(ex)
+                        with col_r2:
+                            if st.button("恢复", key=f"qc_restore_{ex}"):
+                                st.session_state.excluded_stations.remove(ex)
+                                st.rerun()
+        
+        st.markdown("---")
+        st.subheader("📊 快速批量检查")
+        batch_data = []
+        for stn in all_stations:
+            tr_b = display_streams[stn]
+            snr_b = float(abs(tr_b.data).max() / (tr_b.data.std() + 1e-10))
+            if snr_b > 5:
+                qc = "优"
+            elif snr_b >= 2:
+                qc = "中"
+            else:
+                qc = "差"
+            
+            pol_b = "—"
+            for p in st.session_state.polarities:
+                if p[0] == stn:
+                    pol_b = "压缩" if p[3] in ['compressional', 'C', 'c', '+', 1, 'up'] else "拉张"
+                    break
+            
+            excl_b = "是" if stn in st.session_state.excluded_stations else "否"
+            
+            batch_data.append({
+                "台站": stn,
+                "SNR": f"{snr_b:.1f}",
+                "质量评级": qc,
+                "P到时": f"{st.session_state.p_picks.get(stn, '—')}",
+                "初动极性": pol_b,
+                "已排除": excl_b
+            })
+        st.dataframe(pd.DataFrame(batch_data), use_container_width=True, hide_index=True)
+
     elif page == "震源机制解":
         st.header("🎯 震源机制解（沙滩球图）")
         
@@ -551,7 +745,7 @@ else:
                 
                 if st.button("应用矩张量", type="primary"):
                     st.session_state.custom_mt = current_mt
-                    st.success("矩张量已更新")
+                    st.success("矩张量已更新，沙滩球图已刷新")
                     st.rerun()
                 
                 if st.session_state.custom_mt is not None:
@@ -599,10 +793,9 @@ else:
             elif input_method == "初动方向":
                 st.markdown("##### P波初动极性")
                 
-                if not st.session_state.p_picks:
-                    st.warning("⚠️ 请先在 'P/S波拾取' 页面进行P波到时拾取")
-                else:
-                    if st.button("🔄 从波形自动提取初动极性", type="primary"):
+                col_auto1, col_auto2 = st.columns(2)
+                with col_auto1:
+                    if st.button("🔄 从波形自动提取", type="primary"):
                         streams_for_pick = {
                             k: v for k, v in display_streams.items() 
                             if k not in st.session_state.excluded_stations
@@ -610,107 +803,128 @@ else:
                         if not streams_for_pick:
                             st.error("所有台站已被排除，请取消排除")
                         else:
-                            polarities = extract_first_motions(
-                                streams_for_pick,
-                                st.session_state.p_picks,
-                                stations_info
-                            )
-                            st.session_state.polarities = polarities
-                            st.success(f"✅ 成功提取 {len(polarities)} 个台站的初动极性，沙滩球图已更新")
-                            st.rerun()
-                    
-                    if st.session_state.polarities:
-                        active_pols = [
-                            p for p in st.session_state.polarities 
-                            if p[0] not in st.session_state.excluded_stations
-                        ]
-                        st.info(f"当前初动数: {len(active_pols)}（已排除 {len(st.session_state.polarities) - len(active_pols)} 个台站）")
-                        
-                        if st.session_state.excluded_stations:
-                            st.warning(f"排除台站: {', '.join(st.session_state.excluded_stations)}")
-                        
-                        with st.expander("人工校正初动极性", expanded=True):
-                            st.markdown("##### 选择台站校正")
-                            
-                            pol_names = [p[0] for p in st.session_state.polarities]
-                            if pol_names:
-                                edit_station = st.selectbox(
-                                    "选择台站",
-                                    pol_names,
-                                    key="edit_station_pol"
+                            if not st.session_state.p_picks:
+                                st.warning("⚠️ 请先在 P/S波拾取 页面完成P波拾取")
+                            else:
+                                polarities = extract_first_motions(
+                                    streams_for_pick,
+                                    st.session_state.p_picks,
+                                    stations_info
                                 )
-                                
-                                pol_idx = pol_names.index(edit_station)
-                                current_pol = st.session_state.polarities[pol_idx]
-                                
-                                col_p1, col_p2 = st.columns(2)
-                                with col_p1:
-                                    new_az = st.number_input(
-                                        "方位角 (°)",
-                                        0.0, 360.0,
-                                        float(current_pol[1]),
-                                        1.0
-                                    )
-                                    new_pl = st.number_input(
-                                        "倾角 (°)",
-                                        0.0, 90.0,
-                                        float(current_pol[2]),
-                                        1.0
-                                    )
-                                with col_p2:
-                                    new_pol = st.selectbox(
-                                        "极性",
-                                        ["compressional (压缩)", "dilational (拉张)"],
-                                        0 if current_pol[3] in ['compressional', 'C', 'c', '+', 1, 'up'] else 1
-                                    )
-                                
-                                new_pol_val = 'compressional' if 'compressional' in new_pol else 'dilational'
-                                
-                                col_b1, col_b2 = st.columns(2)
-                                with col_b1:
-                                    if st.button("保存修改"):
-                                        quality = current_pol[4] if len(current_pol) > 4 else 'manual'
-                                        st.session_state.polarities[pol_idx] = (
-                                            edit_station, new_az, new_pl, new_pol_val, quality
-                                        )
-                                        st.success("已保存修改")
-                                        st.rerun()
-                                with col_b2:
-                                    if st.button("删除该台站"):
-                                        st.session_state.polarities.pop(pol_idx)
-                                        st.success("已删除")
-                                        st.rerun()
-                                
-                                st.markdown("---")
-                                st.markdown("##### 手动添加台站")
-                                new_station_name = st.text_input("台站名", "NEW01")
-                                
-                                col_a1, col_a2 = st.columns(2)
-                                with col_a1:
-                                    add_az = st.number_input("方位角", 0.0, 360.0, 45.0, key="add_az")
-                                    add_pl = st.number_input("倾角", 0.0, 90.0, 30.0, key="add_pl")
-                                with col_a2:
-                                    add_pol = st.selectbox(
-                                        "极性",
-                                        ["compressional (压缩)", "dilational (拉张)"],
-                                        key="add_pol"
-                                    )
-                                
-                                add_pol_val = 'compressional' if 'compressional' in add_pol else 'dilational'
-                                
-                                col_btn1, col_btn2 = st.columns(2)
-                                with col_btn1:
-                                    if st.button("添加台站"):
-                                        st.session_state.polarities.append(
-                                            (new_station_name, float(add_az), float(add_pl), add_pol_val, 'manual')
-                                        )
-                                        st.success("已添加")
-                                        st.rerun()
-                                with col_btn2:
-                                    if st.button("清空所有初动"):
-                                        st.session_state.polarities = []
-                                        st.warning("已清空所有初动")
-                                        st.rerun()
+                                st.session_state.polarities = polarities
+                                st.success(f"✅ 提取 {len(polarities)} 个，立即见沙滩球图")
+                                st.rerun()
+                
+                with col_auto2:
+                    if st.button("🧹 清空全部"):
+                        st.session_state.polarities = []
+                        st.warning("已清空所有初动")
+                        st.rerun()
+                
+                active_pols = [
+                    p for p in st.session_state.polarities 
+                    if p[0] not in st.session_state.excluded_stations
+                ]
+                excl_count = len(st.session_state.polarities) - len(active_pols)
+                
+                if active_pols:
+                    info_text = f"✅ 有效台站: {len(active_pols)} 个"
+                    if excl_count > 0:
+                        info_text += f"，排除: {excl_count} 个"
+                    st.success(info_text)
+                elif st.session_state.polarities:
+                    st.warning(f"⚠️ {excl_count} 个台站已全部排除")
+                else:
+                    st.info("💡 可直接在下方「手动添加台站」录入，无需先做自动提取")
+                
+                if st.session_state.excluded_stations:
+                    st.caption(f"排除台站: {', '.join(st.session_state.excluded_stations)}")
+                
+                st.markdown("---")
+                st.markdown("##### 📝 手动添加台站（无拾取时也可用）")
+                
+                default_new_name = f"STA{len(st.session_state.polarities) + 1:02d}"
+                pol_names_exist = [p[0] for p in st.session_state.polarities]
+                if default_new_name in pol_names_exist:
+                    default_new_name = f"STA{len(st.session_state.polarities) + 10:02d}"
+                
+                new_station_name = st.text_input("台站名", default_new_name, key="fm_new_name")
+                
+                col_a1, col_a2 = st.columns(2)
+                with col_a1:
+                    add_az = st.number_input("方位角 (°)", 0.0, 360.0, 45.0, 5.0, key="fm_add_az")
+                    add_pl = st.number_input("倾角 (°)", 0.0, 90.0, 30.0, 5.0, key="fm_add_pl")
+                with col_a2:
+                    add_pol = st.radio(
+                        "初动极性",
+                        ["compressional (压缩 ●)", "dilational (拉张 ○)"],
+                        key="fm_add_pol",
+                        horizontal=True
+                    )
+                
+                add_pol_val = 'compressional' if 'compressional' in add_pol else 'dilational'
+                
+                if st.button("➕ 添加台站（添加后立即显示）", use_container_width=True):
+                    new_entry = (new_station_name, float(add_az), float(add_pl), add_pol_val, 'manual')
+                    st.session_state.polarities.append(new_entry)
+                    st.success(f"已添加 {new_station_name} (方位{add_az:.0f}°, 倾{add_pl:.0f}°, {add_pol_val})")
+                    st.rerun()
+                
+                if st.session_state.polarities:
+                    st.markdown("---")
+                    st.markdown("##### 🔧 校正/删除已有台站")
+                    
+                    edit_idx = st.selectbox(
+                        "选择台站",
+                        list(range(len(st.session_state.polarities))),
+                        format_func=lambda i: f"{st.session_state.polarities[i][0]}  "
+                                             f"(az={float(st.session_state.polarities[i][1]):.0f}°, "
+                                             f"pl={float(st.session_state.polarities[i][2]):.0f}°, "
+                                             f"{'●' if st.session_state.polarities[i][3] in ['compressional', 'C', 'c', '+', 1, 'up'] else '○'})",
+                        key="fm_edit_idx"
+                    )
+                    
+                    current_pol = st.session_state.polarities[edit_idx]
+                    
+                    col_e1, col_e2 = st.columns(2)
+                    with col_e1:
+                        edit_az = st.number_input(
+                            "校正方位角 (°)", 0.0, 360.0,
+                            float(current_pol[1]), 1.0, key="fm_edit_az"
+                        )
+                        edit_pl = st.number_input(
+                            "校正倾角 (°)", 0.0, 90.0,
+                            float(current_pol[2]), 1.0, key="fm_edit_pl"
+                        )
+                    with col_e2:
+                        edit_pol_display = st.radio(
+                            "校正极性",
+                            ["compressional (压缩 ●)", "dilational (拉张 ○)"],
+                            0 if current_pol[3] in ['compressional', 'C', 'c', '+', 1, 'up'] else 1,
+                            key="fm_edit_pol", horizontal=True
+                        )
+                    
+                    edit_pol_val = 'compressional' if 'compressional' in edit_pol_display else 'dilational'
+                    qual = current_pol[4] if len(current_pol) > 4 else 'manual'
+                    
+                    changed = (abs(float(current_pol[1]) - edit_az) > 1e-3 or
+                              abs(float(current_pol[2]) - edit_pl) > 1e-3 or
+                              current_pol[3] != edit_pol_val)
+                    
+                    col_b1, col_b2 = st.columns(2)
+                    with col_b1:
+                        save_disabled = not changed
+                        if st.button("💾 保存校正", disabled=save_disabled, use_container_width=True):
+                            st.session_state.polarities[edit_idx] = (
+                                current_pol[0], float(edit_az), float(edit_pl), edit_pol_val, qual
+                            )
+                            st.success(f"已更新 {current_pol[0]}")
+                            st.rerun()
+                    with col_b2:
+                        if st.button("❌ 删除该台站", use_container_width=True):
+                            removed = st.session_state.polarities.pop(edit_idx)
+                            st.warning(f"已删除 {removed[0]}")
+                            st.rerun()
             
             st.markdown("---")
             st.subheader("显示设置")
@@ -764,12 +978,15 @@ else:
                         )
                         st.pyplot(fig_beach, use_container_width=True)
                         
-                        st.markdown("### 📋 初动极性列表")
+                        st.markdown("### 📋 初动极性列表（未排除）")
                         pol_df = first_motion_to_dataframe(active_polarities)
                         st.dataframe(pol_df, use_container_width=True, hide_index=True)
                     except Exception as e:
                         st.error(f"绘制沙滩球图失败: {str(e)}")
                 else:
+                    if st.session_state.polarities and len(st.session_state.polarities) > 0:
+                        st.info("⚠️ 所有台站已被排除，请先取消排除后再查看")
+                    
                     fig, ax = plt.subplots(figsize=(6, 6))
                     circle = Circle((0, 0), 1, fill=True, facecolor='#f0f0f0',
                                    edgecolor='black', linewidth=2.5)
@@ -777,8 +994,10 @@ else:
                     ax.plot([-1, 1], [0, 0], 'k-', linewidth=0.5, alpha=0.3)
                     ax.plot([0, 0], [-1, 1], 'k-', linewidth=0.5, alpha=0.3)
                     ax.text(0, 1.08, 'N', ha='center', fontsize=10, fontweight='bold')
-                    ax.text(0, -0.2, '暂无初动数据\n请从左侧提取或添加', 
-                           ha='center', fontsize=12, color='gray')
+                    
+                    hint = '暂无初动数据\n左侧「手动添加台站」\n或「从波形自动提取」'
+                    ax.text(0, -0.05, hint, 
+                           ha='center', fontsize=11, color='gray')
                     ax.set_xlim(-1.25, 1.25)
                     ax.set_ylim(-1.25, 1.25)
                     ax.set_aspect('equal')
@@ -787,94 +1006,119 @@ else:
                     st.pyplot(fig, use_container_width=True)
         
         st.markdown("---")
-        st.header("📄 事件报告导出")
+        st.header("📄 事件报告 · 复核工作流")
+        st.caption("先预览完整报告，确认无误后再导出 PDF 或打包下载全部材料")
         
-        with st.expander("生成并下载事件报告", expanded=False):
-            report_mt = current_mt if current_mt is not None else st.session_state.custom_mt
-            report_mw = current_mw
-            report_pols = active_polarities if input_method == "初动方向" else st.session_state.polarities
-            report_file_info = st.session_state.mt_file_info
+        report_mt = current_mt if current_mt is not None else st.session_state.custom_mt
+        report_mw = current_mw
+        report_pols = active_polarities if input_method == "初动方向" else st.session_state.polarities
+        report_all_pols = st.session_state.polarities
+        report_file_info = st.session_state.mt_file_info
+        report_excluded = list(st.session_state.excluded_stations)
+        
+        gen_btn = st.button("🔄 生成 / 刷新报告预览", type="primary", use_container_width=True)
+        
+        preview_key = "_report_preview_fig"
+        
+        if gen_btn or (report_mt is not None and preview_key not in st.session_state):
+            try:
+                with st.spinner("正在生成报告预览..."):
+                    report_fig = create_complete_report_figure(
+                        report_mt, report_all_pols, report_excluded,
+                        report_file_info, report_mw, (12, 16)
+                    )
+                    st.session_state[preview_key] = report_fig
+            except Exception as e:
+                st.error(f"生成报告失败: {e}")
+        
+        if st.session_state.get(preview_key) is not None:
+            st.subheader("📑 报告预览")
+            st.pyplot(st.session_state[preview_key], use_container_width=True)
             
-            col_r1, col_r2, col_r3, col_r4 = st.columns(4)
-            with col_r1:
-                st.metric("矩震级 Mw", f"{report_mw:.2f}" if report_mw else "N/A")
-            with col_r2:
-                st.metric("初动台站数", len(report_pols))
-            with col_r3:
-                st.metric("排除台站数", len(st.session_state.excluded_stations))
-            with col_r4:
-                st.metric("文件来源", st.session_state.mt_file_info.get('format', '手动') if st.session_state.mt_file_info else '手动')
+            st.markdown("---")
+            st.subheader("💾 导出选项")
             
-            st.markdown("##### 下载选项")
-            col_dl1, col_dl2, col_dl3 = st.columns(3)
+            col_d1, col_d2, col_d3, col_d4 = st.columns(4)
             
-            with col_dl1:
-                if report_mt is not None:
-                    try:
-                        fig_report = plot_beach_ball_moment_tensor(report_mt, show_axes=True, size=6)
-                        png_buf = save_beachball_to_png(fig_report)
+            with col_d1:
+                try:
+                    bb_fig = None
+                    if report_mt is not None:
+                        bb_fig = plot_beach_ball_moment_tensor(report_mt, show_axes=True, size=6)
+                    elif report_all_pols:
+                        bb_fig = plot_beach_ball_first_motion(report_all_pols, size=6)
+                    if bb_fig:
+                        png_data = save_beachball_to_png(bb_fig)
                         st.download_button(
-                            label="📥 下载沙滩球图 (PNG)",
-                            data=png_buf,
+                            label="📥 沙滩球 PNG",
+                            data=png_data,
                             file_name="beachball.png",
-                            mime="image/png"
+                            mime="image/png",
+                            use_container_width=True
                         )
-                    except Exception as e:
-                        st.error(f"PNG导出失败: {e}")
-                elif report_pols:
-                    try:
-                        fig_report = plot_beach_ball_first_motion(report_pols, size=6)
-                        png_buf = save_beachball_to_png(fig_report)
-                        st.download_button(
-                            label="📥 下载沙滩球图 (PNG)",
-                            data=png_buf,
-                            file_name="beachball_first_motion.png",
-                            mime="image/png"
-                        )
-                    except Exception as e:
-                        st.error(f"PNG导出失败: {e}")
-                else:
-                    st.info("无可用沙滩球图")
+                    else:
+                        st.info("无沙滩球图")
+                except Exception as e:
+                    st.error(f"PNG失败: {e}")
             
-            with col_dl2:
+            with col_d2:
+                try:
+                    pdf_buf = save_report_to_pdf(
+                        st.session_state[preview_key], bb_fig
+                    )
+                    st.download_button(
+                        label="📥 完整报告 PDF",
+                        data=pdf_buf,
+                        file_name="event_report.pdf",
+                        mime="application/pdf",
+                        use_container_width=True
+                    )
+                except Exception as e:
+                    st.error(f"PDF失败: {e}")
+            
+            with col_d3:
                 try:
                     csv_buf = create_first_motion_csv(
-                        report_pols, report_mt, report_mw, report_file_info
+                        report_all_pols, report_mt, report_mw, report_file_info
                     )
                     st.download_button(
-                        label="📥 下载报告 (CSV)",
+                        label="📥 数据文件 CSV",
                         data=csv_buf.getvalue().encode('utf-8-sig'),
                         file_name="event_report.csv",
-                        mime="text/csv"
+                        mime="text/csv",
+                        use_container_width=True
                     )
                 except Exception as e:
-                    st.error(f"CSV导出失败: {e}")
+                    st.error(f"CSV失败: {e}")
             
-            with col_dl3:
+            with col_d4:
                 try:
-                    json_str = create_event_report_json(
-                        report_mt, report_pols, report_mw, report_file_info
+                    zip_buf = create_report_zip_package(
+                        st.session_state[preview_key], bb_fig,
+                        report_all_pols, report_mt,
+                        report_excluded, report_mw, report_file_info
                     )
                     st.download_button(
-                        label="📥 下载报告 (JSON)",
-                        data=json_str.encode('utf-8'),
-                        file_name="event_report.json",
-                        mime="application/json"
+                        label="� 打包下载 ZIP",
+                        data=zip_buf,
+                        file_name="event_report_package.zip",
+                        mime="application/zip",
+                        use_container_width=True
                     )
                 except Exception as e:
-                    st.error(f"JSON导出失败: {e}")
+                    st.error(f"ZIP失败: {e}")
             
-            if report_mt is not None:
-                st.markdown("##### 矩张量分量")
-                st.dataframe(
-                    pd.DataFrame({
-                        "分量": ["Mrr", "Mtt", "Mpp", "Mrt", "Mrp", "Mtp"],
-                        "数值 (N·m)": [f"{v:.4e}" for v in np.array(report_mt)],
-                        "标量矩 M0": f"{calculate_scalar_moment(report_mt):.4e}",
-                        "矩震级 Mw": f"{calculate_moment_magnitude(report_mt):.2f}"
-                    }).head(6),
-                    use_container_width=True, hide_index=True
-                )
+            with st.expander("查看导出文件清单"):
+                st.markdown("""
+| 导出方式 | 包含内容 |
+|---------|---------|
+| 沙滩球 PNG | 单独的沙滩球图高清图片 |
+| 完整报告 PDF | 首页：标题/沙滩球/矩张量/来源/排除/初动表；次页：单独沙滩球图 |
+| 数据文件 CSV | 报告头 + 矩张量6分量 + M0 + Mw + 文件信息 + 初动极性表 |
+| 打包下载 ZIP | PDF + PNG + CSV + JSON + 排除说明README.txt |
+                """)
+                if report_excluded:
+                    st.warning(f"⚠️ 报告中已标记 {len(report_excluded)} 个排除台站（橙色行）")
 
     elif page == "滤波工具":
         st.header("🎛️ 滤波工具")
@@ -970,25 +1214,28 @@ else:
 
     elif page == "台站地图":
         st.header("🗺️ 台站地图")
-        
+        st.caption("点击地图上的标记即可直接选台站，切到其他页面保持选中状态")
+
+        station_names = list(display_streams.keys())
+        quality_metrics = {}
+        for name, tr in display_streams.items():
+            snr = float(abs(tr.data).max() / (tr.data.std() + 1e-10))
+            quality_metrics[name] = snr
+
         col1, col2 = st.columns([3, 1])
         with col2:
             st.subheader("显示设置")
             map_style = st.selectbox(
                 "地图样式",
-                ["OpenStreetMap", "Stamen Terrain", "Stamen Toner"]
+                ["OpenStreetMap", "Stamen Terrain", "Stamen Toner"],
+                key="map_style_key"
             )
-            show_quality = st.checkbox("显示信号质量", value=True)
-            marker_size = st.slider("标记大小", 5, 30, 12)
-            
+            show_quality = st.checkbox("显示信号质量", value=True, key="map_show_q")
+            marker_size = st.slider("标记大小", 5, 30, 12, key="map_marker_size")
+
             st.markdown("---")
             st.subheader("信号质量评估")
-            
-            quality_metrics = {}
-            for name, tr in display_streams.items():
-                snr = float(abs(tr.data).max() / (tr.data.std() + 1e-10))
-                quality_metrics[name] = snr
-            
+
             st.info(f"台站总数: {len(display_streams)}")
             good_count = sum(1 for v in quality_metrics.values() if v > 5)
             medium_count = sum(1 for v in quality_metrics.values() if 2 <= v <= 5)
@@ -996,58 +1243,48 @@ else:
             st.success(f"高质量台站: {good_count}")
             st.warning(f"中等质量台站: {medium_count}")
             st.error(f"低质量台站: {poor_count}")
-            
+
             st.markdown("---")
-            st.subheader("台站选择联动")
-            station_names = list(display_streams.keys())
-            
-            map_selected = None
-            map_data = st.session_state.get("_map_data", None)
-            if map_data and map_data.get("last_object_clicked_tooltip"):
-                tooltip = map_data["last_object_clicked_tooltip"]
-                for sn in station_names:
-                    if sn in tooltip:
-                        map_selected = sn
-                        break
-            
-            if map_selected:
-                st.session_state.selected_station = map_selected
-            
-            select_options = ["（从地图点击选择）"] + station_names
-            current_idx = 0
-            if st.session_state.selected_station and st.session_state.selected_station in station_names:
-                current_idx = station_names.index(st.session_state.selected_station) + 1
-            
-            selected = st.selectbox(
-                "选择台站查看详情",
-                select_options,
-                index=current_idx,
-                key="map_station_select"
-            )
-            
-            if selected != "（从地图点击选择）":
-                st.session_state.selected_station = selected
-            
-            if st.session_state.selected_station and st.session_state.selected_station in station_names:
-                st.success(f"📌 已选中: **{st.session_state.selected_station}**")
-                
-                if st.button("排除该台站（从机制解中排除）"):
-                    if st.session_state.selected_station not in st.session_state.excluded_stations:
-                        st.session_state.excluded_stations.append(st.session_state.selected_station)
-                        st.warning(f"已排除: {st.session_state.selected_station}")
+            st.subheader("当前选中")
+
+            current_sel = st.session_state.get("selected_station")
+            if current_sel and current_sel in station_names:
+                st.success(f"📌 **{current_sel}**")
+                st.caption("切到波形/拾取/频谱/质量检查页面保持选中")
+
+                if current_sel in st.session_state.excluded_stations:
+                    st.warning("⚠️ 此台站已被机制解排除")
+                    if st.button("✅ 恢复该台站", key="map_restore_sel_btn"):
+                        st.session_state.excluded_stations.remove(current_sel)
+                        if "_report_preview_fig" in st.session_state:
+                            del st.session_state["_report_preview_fig"]
+                        st.success(f"已恢复: {current_sel}")
                         st.rerun()
-                
-                if st.session_state.excluded_stations:
-                    with st.expander(f"已排除台站 ({len(st.session_state.excluded_stations)})"):
-                        for ex in list(st.session_state.excluded_stations):
-                            col_ex1, col_ex2 = st.columns([3, 1])
-                            with col_ex1:
-                                st.text(ex)
-                            with col_ex2:
-                                if st.button("恢复", key=f"restore_{ex}"):
-                                    st.session_state.excluded_stations.remove(ex)
-                                    st.rerun()
-        
+                else:
+                    if st.button("🚫 排除该台站", key="map_exclude_sel_btn"):
+                        st.session_state.excluded_stations.append(current_sel)
+                        if "_report_preview_fig" in st.session_state:
+                            del st.session_state["_report_preview_fig"]
+                        st.warning(f"已排除: {current_sel}")
+                        st.rerun()
+            else:
+                st.info("👈 请点击左侧地图标记选择台站")
+
+            if st.session_state.excluded_stations:
+                st.markdown("---")
+                with st.expander(f"已排除台站 ({len(st.session_state.excluded_stations)})", expanded=True):
+                    for ex in list(st.session_state.excluded_stations):
+                        col_ex1, col_ex2 = st.columns([3, 1])
+                        with col_ex1:
+                            st.text(ex)
+                        with col_ex2:
+                            if st.button("恢复", key=f"map_restore_{ex}"):
+                                st.session_state.excluded_stations.remove(ex)
+                                if "_report_preview_fig" in st.session_state:
+                                    del st.session_state["_report_preview_fig"]
+                                st.success(f"已恢复: {ex}")
+                                st.rerun()
+
         with col1:
             try:
                 m = create_station_map(
@@ -1055,24 +1292,57 @@ else:
                     map_style, show_quality, marker_size
                 )
                 from streamlit_folium import st_folium
-                map_ret = st_folium(m, width=800, height=500)
-                if map_ret:
-                    st.session_state["_map_data"] = map_ret
+                map_ret = st_folium(m, width=800, height=520, key="station_map_interactive")
+
+                clicked_station = None
+                if map_ret and isinstance(map_ret, dict):
+                    for field in ["last_object_clicked_tooltip", "last_active_drawing"]:
+                        val = map_ret.get(field)
+                        if isinstance(val, dict) and "tooltip" in val:
+                            val = val["tooltip"]
+                        if isinstance(val, str):
+                            for sn in station_names:
+                                if sn == val or sn in val:
+                                    clicked_station = sn
+                                    break
+                        if clicked_station:
+                            break
+
+                    if not clicked_station:
+                        val = map_ret.get("last_object_clicked")
+                        if isinstance(val, dict):
+                            for prop_key in ["popup", "tooltip", "station", "name", "id"]:
+                                pv = val.get("properties", {}).get(prop_key) or val.get(prop_key)
+                                if isinstance(pv, str):
+                                    for sn in station_names:
+                                        if sn == pv or sn in pv:
+                                            clicked_station = sn
+                                            break
+                                if clicked_station:
+                                    break
+
+                if clicked_station and clicked_station in station_names:
+                    if clicked_station != st.session_state.get("selected_station"):
+                        st.session_state.selected_station = clicked_station
+                        if "_report_preview_fig" in st.session_state:
+                            del st.session_state["_report_preview_fig"]
+                        st.rerun()
             except Exception as e:
                 st.error(f"地图加载失败: {str(e)}")
                 st.info("请确保已安装 folium 和 streamlit-folium 库")
-        
+
         st.markdown("---")
-        
-        if st.session_state.selected_station and st.session_state.selected_station in display_streams:
-            sel_st = st.session_state.selected_station
+
+        sel_st = st.session_state.get("selected_station")
+        if sel_st and sel_st in display_streams:
             st.subheader(f"📊 台站 {sel_st} 联动详情")
-            
+
+            tr_sel = display_streams[sel_st]
+
             col_d1, col_d2, col_d3, col_d4 = st.columns(4)
             with col_d1:
                 st.metric("信噪比 (SNR)", f"{quality_metrics.get(sel_st, 0):.2f}")
             with col_d2:
-                tr_sel = display_streams[sel_st]
                 st.metric("采样率", f"{tr_sel.stats.sampling_rate:.1f} Hz")
             with col_d3:
                 p_time = st.session_state.p_picks.get(sel_st, None)
@@ -1080,66 +1350,68 @@ else:
             with col_d4:
                 s_time = st.session_state.s_picks.get(sel_st, None)
                 st.metric("S波到时", f"{s_time:.2f}s" if s_time else "未拾取")
-            
-            quality_rec = "推荐用于机制解" if quality_metrics.get(sel_st, 0) > 2 else "建议排除"
+
             if sel_st in st.session_state.excluded_stations:
-                st.error(f"⚠️ 该台站已被排除（不会参与机制解计算）")
+                st.error("⚠️ 该台站已被排除（不会参与机制解计算和报告）")
             else:
                 if quality_metrics.get(sel_st, 0) > 5:
-                    st.success(f"🟢 信号质量优，{quality_rec}")
+                    st.success("🟢 信号质量优，推荐用于机制解")
                 elif quality_metrics.get(sel_st, 0) > 2:
-                    st.warning(f"🟡 信号质量中，{quality_rec}")
+                    st.warning("🟡 信号质量中，可用于机制解")
                 else:
-                    st.error(f"🔴 信号质量差，建议排除")
-            
+                    st.error("🔴 信号质量差，建议排除")
+
             import plotly.graph_objects as go
-            tr_sel = display_streams[sel_st]
             t = np.array(tr_sel.times())
             data_sel = np.array(tr_sel.data)
-            
+
             fig_sel = go.Figure()
             fig_sel.add_trace(go.Scatter(x=t, y=data_sel, mode='lines',
                                          name=sel_st, line=dict(color='#1f77b4', width=1)))
-            
+
             if p_time:
                 fig_sel.add_vline(x=p_time, line_dash="dash", line_color="green", line_width=2,
                                   annotation_text=f"P={p_time:.2f}s", annotation_font_color="green")
             if s_time:
                 fig_sel.add_vline(x=s_time, line_dash="dash", line_color="red", line_width=2,
                                   annotation_text=f"S={s_time:.2f}s", annotation_font_color="red")
-            
+
             fig_sel.update_layout(
                 title=f"{sel_st} 波形（带拾取标记）",
                 xaxis_title="时间 (秒)",
                 yaxis_title="振幅",
-                height=300,
+                height=280,
+                margin=dict(l=10, r=10, t=40, b=40),
                 template="plotly_white"
             )
             st.plotly_chart(fig_sel, use_container_width=True)
-            
-            st.session_state.polarities
+
             pol_info = None
             for p in st.session_state.polarities:
                 if p[0] == sel_st:
                     pol_info = p
                     break
-            
+
             if pol_info:
-                col_p1, col_p2, col_p3 = st.columns(3)
+                col_p1, col_p2, col_p3, col_p4 = st.columns(4)
                 with col_p1:
-                    pol_cn = "压缩 (C)" if pol_info[3] in ['compressional', 'C', 'c', '+', 1, 'up'] else "拉张 (D)"
+                    pol_cn = "压缩 (●)" if pol_info[3] in ['compressional', 'C', 'c', '+', 1, 'up'] else "拉张 (○)"
                     st.metric("初动极性", pol_cn)
                 with col_p2:
-                    st.metric("方位角", f"{pol_info[1]:.1f}°")
+                    st.metric("方位角", f"{float(pol_info[1]):.1f}°")
                 with col_p3:
-                    st.metric("倾角", f"{pol_info[2]:.1f}°")
+                    st.metric("倾角", f"{float(pol_info[2]):.1f}°")
+                with col_p4:
+                    qual_map = {'good': '优 🟢', 'medium': '中 🟡', 'poor': '差 🔴', 'manual': '人工 ✏️'}
+                    q = pol_info[4] if len(pol_info) > 4 else '-'
+                    st.metric("质量", qual_map.get(q, str(q)))
                 st.info("💡 可到「震源机制解 → 初动方向」页面校正此台站的极性")
             else:
-                st.info("💡 该台站尚未提取初动极性，请到「震源机制解 → 初动方向」页面提取")
-        
+                st.info("💡 该台站尚未提取初动极性，请到「震源机制解 → 初动方向」页面提取或手动添加")
+
         st.markdown("---")
         st.subheader("📊 全部台站详情")
-        
+
         details = []
         for name, info in stations_info.iterrows():
             snr = quality_metrics.get(name, 0)
@@ -1152,16 +1424,26 @@ else:
             else:
                 quality = "差"
                 quality_color = "🔴"
-            
+
             excluded = "是" if name in st.session_state.excluded_stations else "否"
-            
+
+            pol_marker = "—"
+            for p in st.session_state.polarities:
+                if p[0] == name:
+                    pol_marker = "● 压缩" if p[3] in ['compressional', 'C', 'c', '+', 1, 'up'] else "○ 拉张"
+                    break
+
+            is_sel = "✅" if name == sel_st else ""
+
             details.append({
+                "选中": is_sel,
                 "台站": name,
                 "纬度": info["latitude"],
                 "经度": info["longitude"],
                 "信噪比": round(snr, 2),
                 "信号质量": f"{quality_color} {quality}",
+                "初动极性": pol_marker,
                 "已排除": excluded
             })
-        
+
         st.dataframe(pd.DataFrame(details), use_container_width=True, hide_index=True)
