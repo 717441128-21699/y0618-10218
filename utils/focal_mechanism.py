@@ -610,19 +610,46 @@ def save_beachball_to_png(fig):
     return buf
 
 
-def create_first_motion_csv(polarities, mt=None, mw=None, file_info=None):
-    """生成事件报告CSV字节流"""
+def create_first_motion_csv(polarities, mt=None, mw=None, file_info=None,
+                            excluded_stations=None, active_polarities=None,
+                            review_notes=None):
+    """生成事件报告CSV字节流
+    
+    active_polarities: 有效台站（仅这些写入初动表）
+    review_notes: {station: {status, reason}}
+    """
     import io
     import csv
     from datetime import datetime
-    
+
+    if excluded_stations is None:
+        excluded_stations = []
+    if review_notes is None:
+        review_notes = {}
+    if active_polarities is None:
+        active_polarities = [p for p in polarities
+                            if not (len(p) >= 1 and p[0] in excluded_stations)]
+
     buf = io.StringIO()
     writer = csv.writer(buf)
-    
+
     writer.writerow(['=== 地震事件分析报告 ==='])
     writer.writerow(['生成时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
     writer.writerow([])
-    
+
+    writer.writerow(['--- 概览 ---'])
+    writer.writerow(['总台站', len(polarities)])
+    writer.writerow(['有效台站', len(active_polarities)])
+    writer.writerow(['排除台站', len(excluded_stations)])
+    if review_notes:
+        k_ct = sum(1 for v in review_notes.values() if v.get('status') == 'keep')
+        e_ct = sum(1 for v in review_notes.values() if v.get('status') == 'exclude')
+        r_ct = sum(1 for v in review_notes.values() if v.get('status') == 'review')
+        writer.writerow(['复核保留', k_ct])
+        writer.writerow(['复核排除', e_ct])
+        writer.writerow(['复核待确认', r_ct])
+    writer.writerow([])
+
     if mt is not None:
         mt = np.array(mt)
         writer.writerow(['--- 矩张量信息 ---'])
@@ -633,66 +660,113 @@ def create_first_motion_csv(polarities, mt=None, mw=None, file_info=None):
         writer.writerow(['标量矩 M0', f'{calculate_scalar_moment(mt):.6e} N·m'])
         writer.writerow(['矩震级 Mw', f'{calculate_moment_magnitude(mt):.2f}'])
         writer.writerow([])
-    
+
     if file_info:
         writer.writerow(['--- 文件信息 ---'])
         for k, v in file_info.items():
             writer.writerow([k, str(v)])
         writer.writerow([])
-    
-    writer.writerow(['--- 初动极性数据 ---'])
-    writer.writerow(['台站', '方位角 (°)', '倾角 (°)', '极性', '信噪比质量'])
-    for item in polarities:
+
+    if excluded_stations:
+        writer.writerow(['--- 排除台站列表 ---'])
+        for s in excluded_stations:
+            r = review_notes.get(s, {}).get('reason', '')
+            writer.writerow([s, r])
+        writer.writerow([])
+
+    writer.writerow(['--- 初动极性与复核记录（仅有效台站） ---'])
+    writer.writerow(['台站', '方位角 (°)', '倾角 (°)', '极性', '初动质量',
+                     '复核结论', '备注原因'])
+    for item in active_polarities:
         if len(item) >= 5:
             name, az, pl, pol, qual = item[:5]
+        elif len(item) == 4:
+            name, az, pl, pol = item
+            qual = 'unknown'
         else:
-            name, az, pl, pol = item[:4]
+            name, az, pl, pol = '', float(item[0]), float(item[1]), item[2]
             qual = 'unknown'
         pol_cn = '压缩' if pol in ['compressional', 'C', 'c', '+', 1, 'up'] else '拉张'
-        qual_cn = {'good': '优', 'medium': '中', 'poor': '差', 'unknown': '未知'}.get(qual, qual)
-        writer.writerow([name, f'{az:.1f}', f'{pl:.1f}', pol_cn, qual_cn])
-    
+        qual_cn = {'good': '优', 'medium': '中', 'poor': '差', 'unknown': '-',
+                   'manual': '人工'}.get(qual, qual)
+        note = review_notes.get(name, {})
+        st = note.get('status', '')
+        reason = note.get('reason', '')
+        st_cn = {'keep': '保留', 'exclude': '排除', 'review': '待复核', '': '-'}.get(st, st)
+        writer.writerow([name, f'{float(az):.1f}', f'{float(pl):.1f}',
+                        pol_cn, qual_cn, st_cn, reason])
+
     buf.seek(0)
     return buf
 
 
-def create_event_report_json(mt, polarities, mw=None, file_info=None):
+def create_event_report_json(mt, polarities, mw=None, file_info=None,
+                             excluded_stations=None, active_polarities=None,
+                             review_notes=None):
     """生成事件报告JSON字符串"""
     import json
     from datetime import datetime
-    
+
+    if excluded_stations is None:
+        excluded_stations = []
+    if review_notes is None:
+        review_notes = {}
+    if active_polarities is None:
+        active_polarities = [p for p in polarities
+                            if not (len(p) >= 1 and p[0] in excluded_stations)]
+
     if mw is None and mt is not None:
         mw = calculate_moment_magnitude(mt)
-    
+
+    keep_ct = sum(1 for v in review_notes.values() if v.get('status') == 'keep')
+    excl_ct = sum(1 for v in review_notes.values() if v.get('status') == 'exclude')
+    revw_ct = sum(1 for v in review_notes.values() if v.get('status') == 'review')
+
     report = {
         'report_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'summary': {
+            'total_stations': len(polarities),
+            'active_stations': len(active_polarities),
+            'excluded_stations': len(excluded_stations),
+            'review_keep': keep_ct,
+            'review_exclude': excl_ct,
+            'review_pending': revw_ct
+        },
         'moment_tensor': {},
         'moment_magnitude': round(mw, 2) if mw else None,
         'scalar_moment': float(calculate_scalar_moment(mt)) if mt is not None else None,
+        'excluded_stations': list(excluded_stations),
         'first_motions': [],
+        'review_notes': review_notes,
         'file_info': file_info or {}
     }
-    
+
     if mt is not None:
         mt = np.array(mt)
         labels = ['Mrr', 'Mtt', 'Mpp', 'Mrt', 'Mrp', 'Mtp']
         for label, val in zip(labels, mt):
             report['moment_tensor'][label] = float(val)
-    
-    for item in polarities:
+
+    for item in active_polarities:
         if len(item) >= 5:
             name, az, pl, pol, qual = item[:5]
-        else:
-            name, az, pl, pol = item[:4]
+        elif len(item) == 4:
+            name, az, pl, pol = item
             qual = 'unknown'
+        else:
+            name, az, pl, pol = '', float(item[0]), float(item[1]), item[2]
+            qual = 'unknown'
+        note = review_notes.get(name, {})
         report['first_motions'].append({
             'station': name,
             'azimuth': round(float(az), 1),
             'plunge': round(float(pl), 1),
             'polarity': pol,
-            'quality': qual
+            'quality': qual,
+            'review_status': note.get('status', ''),
+            'review_reason': note.get('reason', '')
         })
-    
+
     return json.dumps(report, ensure_ascii=False, indent=2)
 
 
@@ -814,46 +888,54 @@ def first_motion_to_dataframe(polarities):
     return pd.DataFrame(data)
 
 
-def create_complete_report_figure(mt, polarities, excluded_stations=None, 
-                                  file_info=None, mw=None, size_inches=(11, 15)):
+def create_complete_report_figure(mt, polarities, active_polarities=None,
+                                  excluded_stations=None, file_info=None, mw=None,
+                                  review_notes=None, size_inches=(11, 16)):
     """生成完整的事件报告Figure（用于预览和PDF导出）
-    
-    包含：标题+沙滩球图+矩张量信息+初动极性表+排除台站说明
+
+    参数:
+        active_polarities: 仅参与机制解的有效台站（沙滩球和初动表都按这个画）
+        review_notes: {station_name: {"status": "keep/exclude/review", "reason": "..."}}
     """
     from datetime import datetime
     if excluded_stations is None:
         excluded_stations = []
-    
+    if review_notes is None:
+        review_notes = {}
+    if active_polarities is None:
+        active_polarities = [p for p in polarities
+                            if not (len(p) >= 1 and p[0] in excluded_stations)]
+
     if mw is None and mt is not None:
         mw = calculate_moment_magnitude(mt)
-    
+
     fig = plt.figure(figsize=size_inches)
-    gs = fig.add_gridspec(6, 4, hspace=0.45, wspace=0.25)
-    
+    gs = fig.add_gridspec(7, 4, hspace=0.45, wspace=0.25)
+
     fig.suptitle(
         "地震事件分析报告",
         fontsize=18, fontweight='bold', y=0.99
     )
     fig.text(0.5, 0.965, f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
              ha='center', fontsize=9, color='gray')
-    
+
     ax_beach = fig.add_subplot(gs[0:3, 1:3])
     if mt is not None:
-        ax_beach.set_title("矩张量沙滩球图", fontsize=11, fontweight='bold', pad=8)
+        ax_beach.set_title("矩张量沙滩球图（按有效台站）", fontsize=11, fontweight='bold', pad=8)
         try:
             _plot_beachball_to_axes(mt, ax_beach, show_axes=True)
         except Exception:
             ax_beach.text(0.5, 0.5, '绘制失败', ha='center', va='center')
-    elif polarities:
-        ax_beach.set_title("初动极性沙滩球图", fontsize=11, fontweight='bold', pad=8)
+    elif active_polarities:
+        ax_beach.set_title("初动极性沙滩球图（按有效台站）", fontsize=11, fontweight='bold', pad=8)
         try:
-            _plot_fm_to_axes(polarities, ax_beach)
+            _plot_fm_to_axes(active_polarities, ax_beach)
         except Exception:
             ax_beach.text(0.5, 0.5, '绘制失败', ha='center', va='center')
     else:
-        ax_beach.text(0.5, 0.5, '暂无数据', ha='center', va='center', fontsize=12)
+        ax_beach.text(0.5, 0.5, '暂无有效数据', ha='center', va='center', fontsize=12)
     ax_beach.axis('off')
-    
+
     ax_mt = fig.add_subplot(gs[0:2, 0])
     ax_mt.axis('off')
     ax_mt.set_title("矩张量信息", fontsize=10, fontweight='bold', pad=6)
@@ -874,7 +956,7 @@ def create_complete_report_figure(mt, polarities, excluded_stations=None,
     ax_mt.text(0.03, 0.97, '\n'.join(mt_text),
                ha='left', va='top', fontsize=8.5, family='monospace',
                transform=ax_mt.transAxes)
-    
+
     ax_file = fig.add_subplot(gs[2, 0])
     ax_file.axis('off')
     ax_file.set_title("文件来源信息", fontsize=10, fontweight='bold', pad=6)
@@ -889,34 +971,70 @@ def create_complete_report_figure(mt, polarities, excluded_stations=None,
     ax_file.text(0.03, 0.97, '\n'.join(file_text),
                  ha='left', va='top', fontsize=8,
                  transform=ax_file.transAxes)
-    
-    ax_excl = fig.add_subplot(gs[0:3, 3])
-    ax_excl.axis('off')
-    ax_excl.set_title("台站排除说明", fontsize=10, fontweight='bold', pad=6)
-    excl_text = []
-    if excluded_stations:
-        excl_text.append(f"共排除 {len(excluded_stations)} 个台站：")
-        excl_text.append("")
-        for s in excluded_stations:
-            excl_text.append(f"  • {s}")
-        excl_text.append("")
-        excl_text.append("理由：信号质量差/初动")
-        excl_text.append("极性不可靠，从机制解")
-        excl_text.append("计算中剔除。")
-    else:
-        excl_text.append("未排除任何台站")
-    ax_excl.text(0.03, 0.97, '\n'.join(excl_text),
-                 ha='left', va='top', fontsize=8.5,
-                 transform=ax_excl.transAxes)
-    
-    ax_pol = fig.add_subplot(gs[3:6, :])
-    ax_pol.axis('off')
-    ax_pol.set_title("台站初动极性记录表", fontsize=11, fontweight='bold', pad=6)
-    
-    col_labels = ['台站', '方位角(°)', '倾角(°)', '极性', '质量', '是否排除']
-    cell_data = []
-    active_pols = []
+
+    ax_rev = fig.add_subplot(gs[0:3, 3])
+    ax_rev.axis('off')
+    ax_rev.set_title("复核批注与结论", fontsize=10, fontweight='bold', pad=6)
+
+    keep_ct = sum(1 for v in review_notes.values() if v.get('status') == 'keep')
+    excl_ct = sum(1 for v in review_notes.values() if v.get('status') == 'exclude')
+    revw_ct = sum(1 for v in review_notes.values() if v.get('status') == 'review')
+
+    rev_text = [
+        f"有效台站: {len(active_polarities)}",
+        f"排除台站: {len(excluded_stations)}",
+        "",
+        "—— 复核结论统计 ——",
+        f"✅ 保留: {keep_ct}",
+        f"🚫 排除: {excl_ct}",
+        f"⚠️ 待复核: {revw_ct}",
+        "",
+        "—— 批注明细 ——",
+    ]
     for item in polarities:
+        if len(item) >= 1:
+            sname = item[0]
+        else:
+            continue
+        note = review_notes.get(sname, {})
+        st = note.get('status', '')
+        reason = note.get('reason', '')
+        if st == 'keep':
+            icon = '✅'
+        elif st == 'exclude':
+            icon = '🚫'
+        elif st == 'review':
+            icon = '⚠️'
+        else:
+            icon = '⬜'
+        line = f"{icon} {sname}"
+        if reason:
+            if len(reason) > 12:
+                reason = reason[:12] + '…'
+            line += f": {reason}"
+        rev_text.append(line)
+
+    if len(rev_text) > 38:
+        rev_text = rev_text[:37] + ["  ... （更多见CSV/JSON）"]
+
+    ax_rev.text(0.03, 0.99, '\n'.join(rev_text),
+                ha='left', va='top', fontsize=7.5,
+                transform=ax_rev.transAxes)
+
+    ax_pol = fig.add_subplot(gs[3:7, :])
+    ax_pol.axis('off')
+    ax_pol.set_title("台站初动极性与复核记录表（仅有效台站）", fontsize=11, fontweight='bold', pad=6)
+
+    col_labels = ['台站', '方位角(°)', '倾角(°)', '极性', '初动质量', '复核结论', '备注原因']
+    cell_data = []
+    row_colors = []
+    status_color = {
+        'keep': '#e8f5e9',
+        'exclude': '#ffebee',
+        'review': '#fff8e1',
+        '': 'white'
+    }
+    for item in active_polarities:
         if len(item) >= 5:
             name, az, pl, pol, qual = item[:5]
         elif len(item) == 4:
@@ -925,46 +1043,39 @@ def create_complete_report_figure(mt, polarities, excluded_stations=None,
         else:
             name, az, pl, pol = '', float(item[0]), float(item[1]), item[2]
             qual = 'unknown'
-        is_excl = name in excluded_stations
         pol_cn = '压缩(C)' if pol in ['compressional', 'C', 'c', '+', 1, 'up'] else '拉张(D)'
-        qual_cn = {'good': '优', 'medium': '中', 'poor': '差', 'unknown': '未知',
+        qual_cn = {'good': '优', 'medium': '中', 'poor': '差', 'unknown': '-',
                    'manual': '人工'}.get(qual, str(qual))
-        excl_cn = '是' if is_excl else '否'
+        note = review_notes.get(name, {})
+        st = note.get('status', '')
+        reason = note.get('reason', '')
+        st_cn = {'keep': '保留 ✅', 'exclude': '排除 🚫', 'review': '待复核 ⚠️', '': '-'}.get(st, st)
         cell_data.append([name, f"{float(az):.1f}", f"{float(pl):.1f}",
-                          pol_cn, qual_cn, excl_cn])
-        if not is_excl:
-            active_pols.append(True)
-        else:
-            active_pols.append(False)
-    
+                         pol_cn, qual_cn, st_cn, reason])
+        row_colors.append([status_color.get(st, 'white')] * len(col_labels))
+
     if not cell_data:
-        cell_data.append(['无数据', '', '', '', '', ''])
-    
+        cell_data = [['无有效台站', '', '', '', '', '', '']]
+
     col_colors = ['#e8f0fe'] * len(col_labels)
-    row_colors = []
-    for i, ap in enumerate(active_pols):
-        if ap:
-            row_colors.append('white')
-        else:
-            row_colors.append(['#fff3e0'] * len(col_labels))
-    
     table = ax_pol.table(
         cellText=cell_data,
         colLabels=col_labels,
         colColours=col_colors,
-        rowColours=row_colors if any(not a for a in active_pols) else None,
+        rowColours=row_colors if row_colors else None,
         loc='center',
         cellLoc='center'
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(8)
-    table.scale(1, 1.4)
-    
-    active = sum(1 for x in active_pols if x)
-    fig.text(0.5, 0.02, f"统计：总计 {len(cell_data)} 个台站，其中有效 {active} 个，已排除 "
-                       f"{len(cell_data) - active} 个",
+    table.set_fontsize(7.5)
+    table.scale(1, 1.45)
+
+    fig.text(0.5, 0.02,
+             f"统计：全部 {len(polarities)} 台站，有效 {len(active_polarities)}，"
+             f"排除 {len(excluded_stations)}，"
+             f"复核结论：保留{keep_ct}/排除{excl_ct}/待复核{revw_ct}",
              ha='center', fontsize=9, style='italic')
-    
+
     return fig
 
 
@@ -1098,12 +1209,13 @@ def save_report_to_pdf(report_fig, beachball_fig=None):
     return buf
 
 
-def create_report_zip_package(report_fig, beachball_fig, polarities, mt, 
-                              excluded_stations=None, mw=None, file_info=None):
+def create_report_zip_package(report_fig, beachball_fig, polarities, mt,
+                              excluded_stations=None, mw=None, file_info=None,
+                              active_polarities=None, review_notes=None):
     """生成打包ZIP：PDF报告 + 沙滩球PNG + CSV数据 + JSON报告"""
     import io
     import zipfile
-    
+
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
         try:
@@ -1111,40 +1223,61 @@ def create_report_zip_package(report_fig, beachball_fig, polarities, mt,
             zf.writestr("event_report.pdf", pdf_buf.getvalue())
         except Exception:
             pass
-        
+
         try:
             if beachball_fig is not None:
                 png_buf = save_beachball_to_png(beachball_fig)
                 zf.writestr("beachball.png", png_buf.getvalue())
         except Exception:
             pass
-        
+
         try:
-            csv_buf = create_first_motion_csv(polarities, mt, mw, file_info)
-            zf.writestr("first_motions_and_mt.csv", csv_buf.getvalue().encode('utf-8-sig'))
+            csv_buf = create_first_motion_csv(
+                polarities, mt, mw, file_info,
+                excluded_stations, active_polarities, review_notes
+            )
+            zf.writestr("first_motions_and_mt.csv",
+                       csv_buf.getvalue().encode('utf-8-sig'))
         except Exception:
             pass
-        
+
         try:
-            json_str = create_event_report_json(mt, polarities, mw, file_info)
+            json_str = create_event_report_json(
+                mt, polarities, mw, file_info,
+                excluded_stations, active_polarities, review_notes
+            )
             zf.writestr("event_report.json", json_str.encode('utf-8'))
         except Exception:
             pass
-        
+
+        note_lines = []
+        note_lines.append("地震事件分析报告 - 打包内容说明")
+        note_lines.append("=" * 50)
+        note_lines.append("")
+        note_lines.append("本压缩包包含以下文件：")
+        note_lines.append("  1. event_report.pdf        - 完整事件报告PDF（2页）")
+        note_lines.append("  2. beachball.png           - 沙滩球图高清PNG")
+        note_lines.append("  3. first_motions_and_mt.csv - 矩张量+初动+复核记录")
+        note_lines.append("  4. event_report.json       - 完整结构化数据")
+        note_lines.append("")
         if excluded_stations:
-            note_lines = [
-                "台站排除说明",
-                "=" * 40,
-                "",
-                f"共排除 {len(excluded_stations)} 个台站：",
-                ""
-            ]
+            note_lines.append("-" * 50)
+            note_lines.append(f"已排除台站 ({len(excluded_stations)})：")
             for s in excluded_stations:
-                note_lines.append(f"  - {s}")
+                r = ''
+                if review_notes and s in review_notes:
+                    r = f" — {review_notes[s].get('reason', '')}"
+                note_lines.append(f"  - {s}{r}")
             note_lines.append("")
-            note_lines.append("排除的台站已从机制解计算和沙滩球图中移除。")
-            note_lines.append("可在波形展示、台站地图等页面恢复。")
-            zf.writestr("README_excluded_stations.txt", '\n'.join(note_lines).encode('utf-8'))
-    
+        if review_notes:
+            k_ct = sum(1 for v in review_notes.values() if v.get('status') == 'keep')
+            e_ct = sum(1 for v in review_notes.values() if v.get('status') == 'exclude')
+            r_ct = sum(1 for v in review_notes.values() if v.get('status') == 'review')
+            note_lines.append("-" * 50)
+            note_lines.append(f"复核结论统计：保留 {k_ct} / 排除 {e_ct} / 待复核 {r_ct}")
+            note_lines.append("")
+        note_lines.append("排除的台站已从机制解计算、沙滩球图和报告中移除。")
+        zf.writestr("README_package.txt", '\n'.join(note_lines).encode('utf-8'))
+
     zip_buf.seek(0)
     return zip_buf
