@@ -1,0 +1,18 @@
+{
+  "event_id": "20240101_M6.5",
+  "date": "2024-01-01",
+  "time": "00:00:00",
+  "latitude": 30.45,
+  "longitude": 103.20,
+  "depth_km": 12.5,
+  "magnitude": 6.5,
+  "Mrr": 2.5e18,
+  "Mtt": -1.2e18,
+  "Mpp": -1.3e18,
+  "Mrt": 8.5e17,
+  "Mrp": -4.2e17,
+  "Mtp": 6.8e17,
+  "method": "矩张量反演",
+  "stations_used": 12,
+  "misfit": 0.15
+}

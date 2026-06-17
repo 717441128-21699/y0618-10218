@@ -15,9 +15,22 @@ from utils.data_loader import load_example_data, load_seed_file, load_sac_file
 from utils.waveform_plot import plot_waveforms
 from utils.picking import auto_pick_ps, calculate_epicentral_distance
 from utils.spectrum import compute_spectrum, plot_spectrum
-from utils.focal_mechanism import plot_beach_ball, generate_sample_moment_tensor
+from utils.focal_mechanism import (
+    plot_beach_ball_moment_tensor,
+    plot_beach_ball_first_motion,
+    generate_sample_moment_tensor,
+    extract_first_motions,
+    load_moment_tensor_file,
+    first_motion_to_dataframe,
+    calculate_scalar_moment,
+    calculate_moment_magnitude
+)
 from utils.filter import apply_filter
 from utils.station_map import create_station_map
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import Circle
+import pandas as pd
 
 st.title("🌍 地震波形数据分析工具")
 st.markdown("---")
@@ -298,54 +311,255 @@ else:
     elif page == "震源机制解":
         st.header("🎯 震源机制解（沙滩球图）")
         
+        if "polarities" not in st.session_state:
+            st.session_state.polarities = []
+        if "custom_mt" not in st.session_state:
+            st.session_state.custom_mt = None
+        if "mt_file_info" not in st.session_state:
+            st.session_state.mt_file_info = None
+        
         col1, col2 = st.columns([2, 1])
         with col2:
             st.subheader("输入方式")
             input_method = st.radio(
                 "选择输入方式",
-                ["初动方向", "矩张量", "示例数据"]
+                ["示例数据", "矩张量分量", "上传矩张量文件", "初动方向"],
+                index=0,
+                label_visibility="collapsed"
             )
             
-            if input_method == "示例数据":
-                mt = generate_sample_moment_tensor()
-                st.info("已加载示例矩张量数据")
+            st.markdown("---")
             
-            elif input_method == "矩张量":
-                st.markdown("##### 矩张量分量")
-                mrr = st.number_input("Mrr", -1e18, 1e18, 1.5e17, format="%.2e")
-                mtt = st.number_input("Mtt", -1e18, 1e18, -1.0e17, format="%.2e")
-                mpp = st.number_input("Mpp", -1e18, 1e18, -5.0e16, format="%.2e")
-                mrt = st.number_input("Mrt", -1e18, 1e18, 8.0e16, format="%.2e")
-                mrp = st.number_input("Mrp", -1e18, 1e18, -3.0e16, format="%.2e")
-                mtp = st.number_input("Mtp", -1e18, 1e18, 6.0e16, format="%.2e")
-                mt = [mrr, mtt, mpp, mrt, mrp, mtp]
+            current_mt = None
+            
+            if input_method == "示例数据":
+                current_mt = generate_sample_moment_tensor()
+                st.info("✅ 已加载示例矩张量数据")
+                
+                m0 = calculate_scalar_moment(current_mt)
+                mw = calculate_moment_magnitude(current_mt)
+                st.metric("矩震级 Mw", f"{mw:.2f}")
+            
+            elif input_method == "矩张量分量":
+                st.markdown("##### 手动输入矩张量分量")
+                st.caption("坐标系: 球坐标系 (r, θ, φ) → Mrr, Mtt, Mpp, Mrt, Mrp, Mtp")
+                
+                col_m1, col_m2 = st.columns(2)
+                with col_m1:
+                    mrr = st.number_input("Mrr", value=1.5e17, format="%.2e")
+                    mtt = st.number_input("Mtt", value=-1.0e17, format="%.2e")
+                    mpp = st.number_input("Mpp", value=-5.0e16, format="%.2e")
+                with col_m2:
+                    mrt = st.number_input("Mrt", value=8.0e16, format="%.2e")
+                    mrp = st.number_input("Mrp", value=-3.0e16, format="%.2e")
+                    mtp = st.number_input("Mtp", value=6.0e16, format="%.2e")
+                
+                current_mt = [mrr, mtt, mpp, mrt, mrp, mtp]
+                
+                if st.button("应用矩张量", type="primary"):
+                    st.session_state.custom_mt = current_mt
+                    st.success("矩张量已更新")
+            
+            elif input_method == "上传矩张量文件":
+                st.markdown("##### 上传矩张量文件")
+                st.caption("支持格式: .txt, .csv, .json (6个分量: Mrr, Mtt, Mpp, Mrt, Mrp, Mtp)")
+                
+                mt_file = st.file_uploader(
+                    "选择矩张量文件",
+                    type=["txt", "csv", "json", "dat"]
+                )
+                
+                if mt_file is not None:
+                    try:
+                        mt_loaded, file_info = load_moment_tensor_file(mt_file)
+                        current_mt = mt_loaded
+                        st.session_state.custom_mt = mt_loaded
+                        st.session_state.mt_file_info = file_info
+                        
+                        st.success(f"✅ 文件加载成功 ({file_info.get('format', '未知格式')})")
+                        
+                        mw = calculate_moment_magnitude(mt_loaded)
+                        st.metric("矩震级 Mw", f"{mw:.2f}")
+                        
+                        with st.expander("查看分量详情"):
+                            st.dataframe(
+                                pd.DataFrame({
+                                    "分量": ["Mrr", "Mtt", "Mpp", "Mrt", "Mrp", "Mtp"],
+                                    "数值": [f"{v:.3e}" for v in mt_loaded]
+                                }),
+                                use_container_width=True
+                            )
+                    except Exception as e:
+                        st.error(f"❌ 加载失败: {str(e)}")
+                        st.info("文件应包含6个矩张量分量，空格或逗号分隔")
             
             elif input_method == "初动方向":
-                st.info("根据P波初动方向自动计算震源机制解")
-                num_polarities = st.slider("初动数量", 5, 30, 15)
+                st.markdown("##### P波初动极性")
                 
-                if st.button("从波形提取初动"):
-                    st.success("已从波形数据提取初动方向")
+                if not st.session_state.p_picks:
+                    st.warning("⚠️ 请先在 'P/S波拾取' 页面进行P波到时拾取")
+                else:
+                    if st.button("从波形自动提取初动极性", type="primary"):
+                        polarities = extract_first_motions(
+                            display_streams, 
+                            st.session_state.p_picks,
+                            stations_info
+                        )
+                        st.session_state.polarities = polarities
+                        st.success(f"✅ 成功提取 {len(polarities)} 个台站的初动极性")
+                    
+                    if st.session_state.polarities:
+                        st.info(f"当前初动数: {len(st.session_state.polarities)}")
+                        
+                        with st.expander("人工校正初动极性", expanded=True):
+                            st.markdown("##### 选择台站校正")
+                            
+                            pol_names = [p[0] for p in st.session_state.polarities]
+                            if pol_names:
+                                edit_station = st.selectbox(
+                                    "选择台站",
+                                    pol_names,
+                                    key="edit_station_pol"
+                                )
+                                
+                                pol_idx = pol_names.index(edit_station)
+                                current_pol = st.session_state.polarities[pol_idx]
+                                
+                                col_p1, col_p2 = st.columns(2)
+                                with col_p1:
+                                    new_az = st.number_input(
+                                        "方位角 (°)",
+                                        0.0, 360.0,
+                                        float(current_pol[1]),
+                                        1.0
+                                    )
+                                    new_pl = st.number_input(
+                                        "倾角 (°)",
+                                        0.0, 90.0,
+                                        float(current_pol[2]),
+                                        1.0
+                                    )
+                                with col_p2:
+                                    new_pol = st.selectbox(
+                                        "极性",
+                                        ["compressional (压缩)", "dilational (拉张)"],
+                                        0 if current_pol[3] in ['compressional', 'C', 'c', '+', 1, 'up'] else 1
+                                    )
+                                
+                                new_pol_val = 'compressional' if 'compressional' in new_pol else 'dilational'
+                                
+                                col_b1, col_b2 = st.columns(2)
+                                with col_b1:
+                                    if st.button("保存修改"):
+                                        quality = current_pol[4] if len(current_pol) > 4 else 'manual'
+                                        st.session_state.polarities[pol_idx] = (
+                                            edit_station, new_az, new_pl, new_pol_val, quality
+                                        )
+                                        st.success("已保存修改")
+                                with col_b2:
+                                    if st.button("删除该台站"):
+                                        st.session_state.polarities.pop(pol_idx)
+                                        st.success("已删除")
+                                
+                                st.markdown("---")
+                                st.markdown("##### 手动添加台站")
+                                new_station_name = st.text_input("台站名", "NEW01")
+                                
+                                col_a1, col_a2 = st.columns(2)
+                                with col_a1:
+                                    add_az = st.number_input("方位角", 0.0, 360.0, 45.0, key="add_az")
+                                    add_pl = st.number_input("倾角", 0.0, 90.0, 30.0, key="add_pl")
+                                with col_a2:
+                                    add_pol = st.selectbox(
+                                        "极性",
+                                        ["compressional (压缩)", "dilational (拉张)"],
+                                        key="add_pol"
+                                    )
+                                
+                                add_pol_val = 'compressional' if 'compressional' in add_pol else 'dilational'
+                                
+                                if st.button("添加台站"):
+                                    st.session_state.polarities.append(
+                                        (new_station_name, add_az, add_pl, add_pol_val, 'manual')
+                                    )
+                                    st.success("已添加")
+                                
+                                if st.button("清空所有初动"):
+                                    st.session_state.polarities = []
+                                    st.warning("已清空所有初动")
             
             st.markdown("---")
             st.subheader("显示设置")
-            beachball_size = st.slider("沙滩球大小", 100, 400, 300)
-            show_axes = st.checkbox("显示主应力轴", value=True)
-            show_fault_planes = st.checkbox("显示断层面", value=True)
+            show_axes = st.checkbox("显示主应力轴 (T/P轴)", value=True)
+            show_nodal = st.checkbox("显示节线", value=True)
         
         with col1:
-            try:
-                fig_beach = plot_beach_ball(
-                    input_method,
-                    mt if input_method == "矩张量" else None,
-                    beachball_size,
-                    show_axes,
-                    show_fault_planes
-                )
-                st.pyplot(fig_beach)
-            except Exception as e:
-                st.error(f"绘制沙滩球图失败: {str(e)}")
-                st.info("请确保已安装 obspy 库")
+            if input_method in ["示例数据", "矩张量分量", "上传矩张量文件"]:
+                mt_to_plot = None
+                if input_method == "示例数据":
+                    mt_to_plot = generate_sample_moment_tensor()
+                elif input_method == "矩张量分量":
+                    if 'current_mt' in locals() and current_mt is not None:
+                        mt_to_plot = current_mt
+                    elif st.session_state.custom_mt is not None:
+                        mt_to_plot = st.session_state.custom_mt
+                    else:
+                        mt_to_plot = generate_sample_moment_tensor()
+                elif input_method == "上传矩张量文件":
+                    if st.session_state.custom_mt is not None:
+                        mt_to_plot = st.session_state.custom_mt
+                    else:
+                        mt_to_plot = generate_sample_moment_tensor()
+                
+                if mt_to_plot is not None:
+                    try:
+                        fig_beach = plot_beach_ball_moment_tensor(
+                            mt_to_plot,
+                            show_axes=show_axes,
+                            size=6
+                        )
+                        st.pyplot(fig_beach, use_container_width=True)
+                    except Exception as e:
+                        st.error(f"绘制沙滩球图失败: {str(e)}")
+                        import traceback
+                        st.code(traceback.format_exc())
+                else:
+                    st.info("请输入或上传矩张量数据")
+            
+            elif input_method == "初动方向":
+                if st.session_state.polarities and len(st.session_state.polarities) > 0:
+                    try:
+                        fig_beach = plot_beach_ball_first_motion(
+                            st.session_state.polarities,
+                            size=6
+                        )
+                        st.pyplot(fig_beach, use_container_width=True)
+                        
+                        st.markdown("### 📋 初动极性列表")
+                        pol_df = first_motion_to_dataframe(st.session_state.polarities)
+                        st.dataframe(pol_df, use_container_width=True, hide_index=True)
+                    except Exception as e:
+                        st.error(f"绘制沙滩球图失败: {str(e)}")
+                        import traceback
+                        st.code(traceback.format_exc())
+                else:
+                    st.info("👈 请在左侧点击「从波形自动提取初动极性」，或手动添加台站")
+                    
+                    fig, ax = plt.subplots(figsize=(6, 6))
+                    circle = Circle((0, 0), 1, fill=True, facecolor='#f0f0f0',
+                                   edgecolor='black', linewidth=2.5)
+                    ax.add_patch(circle)
+                    ax.plot([-1, 1], [0, 0], 'k-', linewidth=0.5, alpha=0.3)
+                    ax.plot([0, 0], [-1, 1], 'k-', linewidth=0.5, alpha=0.3)
+                    ax.text(0, 1.08, 'N', ha='center', fontsize=10, fontweight='bold')
+                    ax.text(0, -0.2, '暂无初动数据\n请从左侧提取或添加', 
+                           ha='center', fontsize=12, color='gray')
+                    ax.set_xlim(-1.25, 1.25)
+                    ax.set_ylim(-1.25, 1.25)
+                    ax.set_aspect('equal')
+                    ax.axis('off')
+                    ax.set_title('震源机制解 (初动极性)', fontsize=13, fontweight='bold', pad=10)
+                    st.pyplot(fig, use_container_width=True)
 
     elif page == "滤波工具":
         st.header("🎛️ 滤波工具")
