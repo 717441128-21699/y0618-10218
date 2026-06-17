@@ -4,6 +4,9 @@ from matplotlib.patches import Circle, Polygon
 from matplotlib.path import Path
 import pandas as pd
 
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
 
 def generate_sample_moment_tensor():
     """生成示例矩张量 (Mrr, Mtt, Mpp, Mrt, Mrp, Mtp)"""
@@ -298,11 +301,16 @@ def plot_beach_ball_first_motion(polarities, show_border=True, size=6):
         ax.add_patch(circle)
     
     for item in polarities:
-        if len(item) == 4:
-            name, az, pl, pol = item
+        if len(item) >= 4:
+            name = item[0]
+            az = float(item[1])
+            pl = float(item[2])
+            pol = item[3]
         else:
-            az, pl, pol = item
             name = ''
+            az = float(item[0])
+            pl = float(item[1])
+            pol = item[2]
         
         x, y = equal_area_projection(az, pl)
         
@@ -455,6 +463,8 @@ def extract_first_motions(streams, p_picks, stations_info=None):
     """
     从波形和P波到时提取初动极性
     
+    对每个有P波到时的台站，都会返回一个极性结果（不会跳过）。
+    
     参数:
         streams: 字典 {station_name: obspy.Trace}
         p_picks: 字典 {station_name: p_arrival_time_seconds}
@@ -471,83 +481,86 @@ def extract_first_motions(streams, p_picks, stations_info=None):
             stations_info, p_picks
         )
     
-    for station_name, tr in streams.items():
+    station_list = list(streams.keys())
+    
+    for station_name in station_list:
+        tr = streams[station_name]
+        
         if station_name not in p_picks:
             continue
         
         p_time = p_picks[station_name]
         sampling_rate = tr.stats.sampling_rate
-        data = tr.data
+        data = np.asarray(tr.data, dtype=float)
+        npts = len(data)
         
         p_idx = int(p_time * sampling_rate)
-        if p_idx < 5 or p_idx >= len(data) - 10:
-            continue
         
-        window_before_start = max(0, p_idx - int(1.0 * sampling_rate))
-        window_before_end = max(0, p_idx - int(0.1 * sampling_rate))
+        if p_idx < 2:
+            p_idx = 2
+        if p_idx >= npts - 2:
+            p_idx = npts - 3
         
-        if window_before_end > window_before_start:
-            noise_std = np.std(data[window_before_start:window_before_end])
-        else:
-            noise_std = np.std(data[:p_idx]) if p_idx > 10 else 1e-10
-        
+        pre_start = max(0, p_idx - int(1.0 * sampling_rate))
+        pre_end = max(pre_start + 1, p_idx - 2)
+        noise_data = data[pre_start:pre_end]
+        noise_std = float(np.std(noise_data)) if len(noise_data) > 1 else 1e-10
         if noise_std < 1e-10:
             noise_std = 1e-10
         
-        search_start = p_idx - int(0.05 * sampling_rate)
-        search_end = min(len(data), p_idx + int(0.5 * sampling_rate))
+        post_start = p_idx
+        post_len = int(0.8 * sampling_rate)
+        post_end = min(npts, post_start + post_len)
         
-        if search_start < 0:
-            search_start = 0
-        if search_end <= search_start + 2:
+        if post_end - post_start < 3:
+            post_end = min(npts, post_start + 5)
+        
+        post_data = data[post_start:post_end]
+        
+        if len(post_data) < 2:
             continue
         
-        search_data = data[search_start:search_end]
+        pos_vals = []
+        neg_vals = []
+        for i in range(1, len(post_data)):
+            if post_data[i] > post_data[i-1]:
+                pos_vals.append((i, post_data[i]))
+            else:
+                neg_vals.append((i, post_data[i]))
         
-        first_peak_idx = None
-        first_peak_val = -float('inf')
-        first_trough_idx = None
-        first_trough_val = float('inf')
+        first_significant_pos = None
+        first_significant_neg = None
+        threshold = noise_std * 1.0
         
-        threshold = noise_std * 1.5
+        for i in range(1, len(post_data) - 1):
+            val = post_data[i]
+            if val > threshold and val >= post_data[i-1] and val >= post_data[i+1]:
+                if first_significant_pos is None:
+                    first_significant_pos = i
+            if val < -threshold and val <= post_data[i-1] and val <= post_data[i+1]:
+                if first_significant_neg is None:
+                    first_significant_neg = i
         
-        for i in range(1, len(search_data) - 1):
-            val = search_data[i]
-            
-            if val > threshold and val > search_data[i-1] and val > search_data[i+1]:
-                if first_peak_idx is None:
-                    first_peak_idx = i
-                    first_peak_val = val
-            
-            if val < -threshold and val < search_data[i-1] and val < search_data[i+1]:
-                if first_trough_idx is None:
-                    first_trough_idx = i
-                    first_trough_val = val
-            
-            if first_peak_idx is not None and first_trough_idx is not None:
-                break
-        
-        if first_peak_idx is None and first_trough_idx is None:
-            if search_data[0] < search_data[-1]:
+        if first_significant_pos is not None and first_significant_neg is not None:
+            if first_significant_pos <= first_significant_neg:
                 polarity = 'compressional'
-                amplitude = abs(search_data[-1])
+                amplitude = abs(post_data[first_significant_pos])
             else:
                 polarity = 'dilational'
-                amplitude = abs(search_data[0])
-            quality = 'poor'
-        elif first_peak_idx is not None and first_trough_idx is not None:
-            if first_peak_idx < first_trough_idx:
-                polarity = 'compressional'
-                amplitude = abs(first_peak_val)
-            else:
-                polarity = 'dilational'
-                amplitude = abs(first_trough_val)
-        elif first_peak_idx is not None:
+                amplitude = abs(post_data[first_significant_neg])
+        elif first_significant_pos is not None:
             polarity = 'compressional'
-            amplitude = abs(first_peak_val)
-        else:
+            amplitude = abs(post_data[first_significant_pos])
+        elif first_significant_neg is not None:
             polarity = 'dilational'
-            amplitude = abs(first_trough_val)
+            amplitude = abs(post_data[first_significant_neg])
+        else:
+            early_samples = post_data[:min(10, len(post_data))]
+            if np.mean(early_samples) >= 0:
+                polarity = 'compressional'
+            else:
+                polarity = 'dilational'
+            amplitude = float(np.max(np.abs(early_samples)))
         
         snr = amplitude / noise_std if noise_std > 0 else 0
         
@@ -560,30 +573,127 @@ def extract_first_motions(streams, p_picks, stations_info=None):
         
         if stations_info is not None and station_name in stations_info.index:
             info = stations_info.loc[station_name]
-            st_lat = info["latitude"]
-            st_lon = info["longitude"]
+            st_lat = float(info["latitude"])
+            st_lon = float(info["longitude"])
             
             azimuth = compute_station_azimuth(st_lat, st_lon, source_lat, source_lon)
             
             dist_km = info.get("distance_km", None)
             if dist_km is None or dist_km == 0:
                 dist_km = compute_distance_km(source_lat, source_lon, st_lat, st_lon)
+            else:
+                dist_km = float(dist_km)
             
             takeoff = compute_takeoff_angle(dist_km, source_depth)
             plunge = 90 - takeoff
         else:
-            station_idx = list(streams.keys()).index(station_name)
-            azimuth = (station_idx * 360 / len(streams) + 30) % 360
-            plunge = 30 + (station_idx % 3) * 20
+            station_idx = station_list.index(station_name)
+            n = max(len(station_list), 1)
+            azimuth = (station_idx * 360.0 / n + 30.0) % 360.0
+            plunge = 30.0 + (station_idx % 3) * 20.0
         
-        if plunge < 0:
-            plunge = 0
-        if plunge > 90:
-            plunge = 90
+        plunge = max(0.0, min(90.0, plunge))
+        azimuth = azimuth % 360.0
         
-        polarities.append((station_name, azimuth, plunge, polarity, quality))
+        polarities.append((station_name, float(azimuth), float(plunge), polarity, quality))
     
     return polarities
+
+
+def save_beachball_to_png(fig):
+    """将matplotlib Figure保存为PNG字节流"""
+    import io
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=150, bbox_inches='tight',
+                facecolor='white', edgecolor='none')
+    buf.seek(0)
+    return buf
+
+
+def create_first_motion_csv(polarities, mt=None, mw=None, file_info=None):
+    """生成事件报告CSV字节流"""
+    import io
+    import csv
+    from datetime import datetime
+    
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    
+    writer.writerow(['=== 地震事件分析报告 ==='])
+    writer.writerow(['生成时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+    writer.writerow([])
+    
+    if mt is not None:
+        mt = np.array(mt)
+        writer.writerow(['--- 矩张量信息 ---'])
+        writer.writerow(['分量', '数值 (N·m)'])
+        labels = ['Mrr', 'Mtt', 'Mpp', 'Mrt', 'Mrp', 'Mtp']
+        for label, val in zip(labels, mt):
+            writer.writerow([label, f'{val:.6e}'])
+        writer.writerow(['标量矩 M0', f'{calculate_scalar_moment(mt):.6e} N·m'])
+        writer.writerow(['矩震级 Mw', f'{calculate_moment_magnitude(mt):.2f}'])
+        writer.writerow([])
+    
+    if file_info:
+        writer.writerow(['--- 文件信息 ---'])
+        for k, v in file_info.items():
+            writer.writerow([k, str(v)])
+        writer.writerow([])
+    
+    writer.writerow(['--- 初动极性数据 ---'])
+    writer.writerow(['台站', '方位角 (°)', '倾角 (°)', '极性', '信噪比质量'])
+    for item in polarities:
+        if len(item) >= 5:
+            name, az, pl, pol, qual = item[:5]
+        else:
+            name, az, pl, pol = item[:4]
+            qual = 'unknown'
+        pol_cn = '压缩' if pol in ['compressional', 'C', 'c', '+', 1, 'up'] else '拉张'
+        qual_cn = {'good': '优', 'medium': '中', 'poor': '差', 'unknown': '未知'}.get(qual, qual)
+        writer.writerow([name, f'{az:.1f}', f'{pl:.1f}', pol_cn, qual_cn])
+    
+    buf.seek(0)
+    return buf
+
+
+def create_event_report_json(mt, polarities, mw=None, file_info=None):
+    """生成事件报告JSON字符串"""
+    import json
+    from datetime import datetime
+    
+    if mw is None and mt is not None:
+        mw = calculate_moment_magnitude(mt)
+    
+    report = {
+        'report_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'moment_tensor': {},
+        'moment_magnitude': round(mw, 2) if mw else None,
+        'scalar_moment': float(calculate_scalar_moment(mt)) if mt is not None else None,
+        'first_motions': [],
+        'file_info': file_info or {}
+    }
+    
+    if mt is not None:
+        mt = np.array(mt)
+        labels = ['Mrr', 'Mtt', 'Mpp', 'Mrt', 'Mrp', 'Mtp']
+        for label, val in zip(labels, mt):
+            report['moment_tensor'][label] = float(val)
+    
+    for item in polarities:
+        if len(item) >= 5:
+            name, az, pl, pol, qual = item[:5]
+        else:
+            name, az, pl, pol = item[:4]
+            qual = 'unknown'
+        report['first_motions'].append({
+            'station': name,
+            'azimuth': round(float(az), 1),
+            'plunge': round(float(pl), 1),
+            'polarity': pol,
+            'quality': qual
+        })
+    
+    return json.dumps(report, ensure_ascii=False, indent=2)
 
 
 def load_moment_tensor_file(file_obj):

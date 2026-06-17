@@ -23,7 +23,7 @@ def generate_synthetic_waveform(duration, sampling_rate, station_name,
     p_mask = (t >= p_arrival) & (t < p_arrival + p_duration)
     p_env = np.zeros_like(t)
     p_window = np.arange(int(p_duration * sampling_rate)) / (p_duration * sampling_rate)
-    p_env[p_mask] = np.sin(np.pi * p_window) * (1 - 0.3 * p_window)
+    p_env[p_mask] = np.sin(np.pi * p_window[:p_mask.sum()]) * (1 - 0.3 * p_window[:p_mask.sum()])
     
     p_freq = 3.0 + np.random.rand() * 2.0
     p_wave = np.sin(2 * np.pi * p_freq * (t - p_arrival))
@@ -33,7 +33,7 @@ def generate_synthetic_waveform(duration, sampling_rate, station_name,
     s_mask = (t >= s_arrival) & (t < s_arrival + s_duration)
     s_env = np.zeros_like(t)
     s_window = np.arange(int(s_duration * sampling_rate)) / (s_duration * sampling_rate)
-    s_env[s_mask] = np.sin(np.pi * s_window) * (1 - 0.5 * s_window)
+    s_env[s_mask] = np.sin(np.pi * s_window[:s_mask.sum()]) * (1 - 0.5 * s_window[:s_mask.sum()])
     
     s_freq = 1.5 + np.random.rand() * 1.0
     s_wave = np.sin(2 * np.pi * s_freq * (t - s_arrival))
